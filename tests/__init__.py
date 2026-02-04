@@ -1,0 +1,1 @@
+"""Posthumous test suite."""
