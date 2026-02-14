@@ -359,3 +359,298 @@ class TestParseDurationExtended:
     def test_parse_string_number(self):
         """Bare number string should be parsed as seconds."""
         assert parse_duration("3600") == timedelta(seconds=3600)
+
+
+class TestConfigEdgeCases:
+    """Edge-case tests for uncovered Config paths."""
+
+    def test_save_exception_cleanup(self, tmp_path):
+        """When os.replace fails during save, temp file should be cleaned up."""
+        from unittest.mock import patch
+
+        config = Config(
+            node_name="test",
+            secret_key="JBSWY3DPEHPK3PXP",
+            config_dir=tmp_path,
+        )
+        config_path = tmp_path / "config.yaml"
+
+        # Patch os.replace to fail after temp file is created
+        with patch('os.replace', side_effect=OSError("disk full")):
+            with pytest.raises(OSError, match="disk full"):
+                config.save(config_path)
+
+        # Temp file should have been cleaned up
+        import glob
+        temp_files = glob.glob(str(tmp_path / ".config_*.yaml.tmp"))
+        assert len(temp_files) == 0
+
+    def test_format_duration_fractional(self):
+        """Fractional seconds that don't evenly divide into larger units."""
+        config = Config(
+            node_name="test",
+            secret_key="JBSWY3DPEHPK3PXP",
+            checkin_interval=timedelta(seconds=90),  # 1.5 minutes
+        )
+        data = config.to_dict()
+        # 90 seconds doesn't evenly divide into minutes (90/60=1.5)
+        # So it should fall through to seconds
+        assert "90 seconds" in data['checkin_interval']
+
+    def test_get_default_config_path(self):
+        """Verify default config path construction."""
+        path = Config.get_default_config_path()
+        assert path == Path.home() / ".posthumous" / "config.yaml"
+
+
+class TestConfigEncryption:
+    """Tests for encryption-related config methods."""
+
+    def test_encrypt_at_rest_in_to_dict(self):
+        """encrypt_at_rest=True should appear in to_dict output."""
+        config = Config(
+            node_name="test",
+            secret_key="JBSWY3DPEHPK3PXP",
+            encrypt_at_rest=True,
+        )
+        data = config.to_dict()
+        assert data['encrypt_at_rest'] is True
+
+    def test_encrypt_at_rest_false_not_in_to_dict(self):
+        """encrypt_at_rest=False should NOT appear in to_dict output."""
+        config = Config(
+            node_name="test",
+            secret_key="JBSWY3DPEHPK3PXP",
+            encrypt_at_rest=False,
+        )
+        data = config.to_dict()
+        assert 'encrypt_at_rest' not in data
+
+    def test_get_encryption_key_enabled(self):
+        """get_encryption_key should return a key when encryption is enabled."""
+        config = Config(
+            node_name="test",
+            secret_key="JBSWY3DPEHPK3PXP",
+            encrypt_at_rest=True,
+        )
+        key = config.get_encryption_key()
+        assert key is not None
+        assert isinstance(key, bytes)
+
+    def test_get_encryption_key_disabled(self):
+        """get_encryption_key should return None when encryption is disabled."""
+        config = Config(
+            node_name="test",
+            secret_key="JBSWY3DPEHPK3PXP",
+            encrypt_at_rest=False,
+        )
+        assert config.get_encryption_key() is None
+
+
+class TestConfigSaveExceptionHandling:
+    """Tests for save() exception handler paths."""
+
+    def test_save_replace_and_unlink_both_fail(self, tmp_path):
+        """When os.replace and os.unlink both fail, exception propagates."""
+        from unittest.mock import patch
+
+        config = Config(
+            node_name="test",
+            secret_key="JBSWY3DPEHPK3PXP",
+            config_dir=tmp_path,
+        )
+        config_path = tmp_path / "config.yaml"
+
+        with patch('os.replace', side_effect=OSError("disk full")), \
+             patch('os.unlink', side_effect=OSError("permission denied")):
+            with pytest.raises(OSError, match="disk full"):
+                config.save(config_path)
+
+
+class TestCheckInterval:
+    """Tests for check_interval config field (Issue 8)."""
+
+    def test_default_is_none(self):
+        config = Config(
+            node_name="test",
+            secret_key="JBSWY3DPEHPK3PXP",
+        )
+        assert config.check_interval is None
+
+    def test_from_dict_with_check_interval(self):
+        data = {
+            "node_name": "test",
+            "secret_key": "JBSWY3DPEHPK3PXP",
+            "check_interval": "5 seconds",
+        }
+        config = Config.from_dict(data)
+        assert config.check_interval == timedelta(seconds=5)
+
+    def test_from_dict_without_check_interval(self):
+        data = {
+            "node_name": "test",
+            "secret_key": "JBSWY3DPEHPK3PXP",
+        }
+        config = Config.from_dict(data)
+        assert config.check_interval is None
+
+
+class TestBaseUrl:
+    """Tests for base_url config field."""
+
+    def test_default_is_none(self):
+        config = Config(
+            node_name="test",
+            secret_key="JBSWY3DPEHPK3PXP",
+        )
+        assert config.base_url is None
+
+    def test_from_dict_with_base_url(self):
+        data = {
+            "node_name": "test",
+            "secret_key": "JBSWY3DPEHPK3PXP",
+            "base_url": "https://posthumous.example.com:8420",
+        }
+        config = Config.from_dict(data)
+        assert config.base_url == "https://posthumous.example.com:8420"
+
+    def test_from_dict_without_base_url(self):
+        data = {
+            "node_name": "test",
+            "secret_key": "JBSWY3DPEHPK3PXP",
+        }
+        config = Config.from_dict(data)
+        assert config.base_url is None
+
+    def test_to_dict_with_base_url(self):
+        config = Config(
+            node_name="test",
+            secret_key="JBSWY3DPEHPK3PXP",
+            base_url="https://example.com:8420",
+        )
+        data = config.to_dict()
+        assert data["base_url"] == "https://example.com:8420"
+
+    def test_to_dict_without_base_url(self):
+        config = Config(
+            node_name="test",
+            secret_key="JBSWY3DPEHPK3PXP",
+        )
+        data = config.to_dict()
+        assert "base_url" not in data
+
+    def test_validate_valid_http_url(self):
+        config = Config(
+            node_name="test",
+            secret_key="JBSWY3DPEHPK3PXP",
+            base_url="http://localhost:8420",
+        )
+        errors = config.validate()
+        assert not any("base_url" in e for e in errors)
+
+    def test_validate_valid_https_url(self):
+        config = Config(
+            node_name="test",
+            secret_key="JBSWY3DPEHPK3PXP",
+            base_url="https://posthumous.example.com",
+        )
+        errors = config.validate()
+        assert not any("base_url" in e for e in errors)
+
+    def test_validate_invalid_base_url(self):
+        config = Config(
+            node_name="test",
+            secret_key="JBSWY3DPEHPK3PXP",
+            base_url="ftp://example.com",
+        )
+        errors = config.validate()
+        assert any("base_url" in e for e in errors)
+
+    def test_validate_bare_hostname_invalid(self):
+        config = Config(
+            node_name="test",
+            secret_key="JBSWY3DPEHPK3PXP",
+            base_url="example.com:8420",
+        )
+        errors = config.validate()
+        assert any("base_url" in e for e in errors)
+
+    def test_get_base_url_explicit(self):
+        config = Config(
+            node_name="test",
+            secret_key="JBSWY3DPEHPK3PXP",
+            base_url="https://example.com:8420",
+        )
+        assert config.get_base_url() == "https://example.com:8420"
+
+    def test_get_base_url_strips_trailing_slash(self):
+        config = Config(
+            node_name="test",
+            secret_key="JBSWY3DPEHPK3PXP",
+            base_url="https://example.com:8420/",
+        )
+        assert config.get_base_url() == "https://example.com:8420"
+
+    def test_get_base_url_auto_from_listen(self):
+        config = Config(
+            node_name="test",
+            secret_key="JBSWY3DPEHPK3PXP",
+            listen="0.0.0.0:8420",
+        )
+        assert config.get_base_url() == "http://localhost:8420"
+
+    def test_get_base_url_auto_custom_listen(self):
+        config = Config(
+            node_name="test",
+            secret_key="JBSWY3DPEHPK3PXP",
+            listen="192.168.1.5:9000",
+        )
+        assert config.get_base_url() == "http://192.168.1.5:9000"
+
+    def test_round_trip_with_base_url(self, tmp_path):
+        config = Config(
+            node_name="test",
+            secret_key="JBSWY3DPEHPK3PXP",
+            base_url="https://example.com:8420",
+            config_dir=tmp_path,
+        )
+        config_path = tmp_path / "config.yaml"
+        config.save(config_path)
+
+        loaded = Config.from_yaml(config_path)
+        assert loaded.base_url == "https://example.com:8420"
+
+
+class TestDefaultConfigMessages:
+    """Tests for default config notification messages."""
+
+    def test_warning_message_includes_checkin_url(self):
+        config = generate_default_config("test", "JBSWY3DPEHPK3PXP")
+        assert "{checkin_url}" in config.on_warning[0].message
+
+    def test_grace_message_includes_checkin_url(self):
+        config = generate_default_config("test", "JBSWY3DPEHPK3PXP")
+        assert "{checkin_url}" in config.on_grace[0].message
+
+    def test_trigger_message_includes_dashboard_url(self):
+        config = generate_default_config("test", "JBSWY3DPEHPK3PXP")
+        assert "{dashboard_url}" in config.on_trigger[0].message
+
+
+class TestParseActionsEdgeCases:
+    """Tests for action parsing edge cases."""
+
+    def test_unknown_action_type_skipped(self):
+        """Actions with neither 'notify' nor 'script' should be skipped."""
+        data = {
+            "node_name": "test",
+            "secret_key": "JBSWY3DPEHPK3PXP",
+            "actions": {
+                "on_warning": [
+                    {"notify": "default", "message": "hello"},
+                    {"unknown_key": "value"},  # Should be skipped
+                ],
+            },
+        }
+        config = Config.from_dict(data)
+        assert len(config.on_warning) == 1

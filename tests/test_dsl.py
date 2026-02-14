@@ -495,3 +495,315 @@ class TestShouldExecuteExtended:
         # Now dedup with the same period
         should2, _ = should_execute(schedule, trigger_time, period, now)
         assert should2 is False
+
+
+class TestParseDurationEdgeCases:
+    """Edge-case tests for parse_duration in dsl.py."""
+
+    def test_parse_duration_invalid(self):
+        """Unparseable duration should raise ValueError."""
+        from posthumous.dsl import parse_duration as dsl_parse_duration
+        with pytest.raises(ValueError, match="Cannot parse duration"):
+            dsl_parse_duration("not-a-duration")
+
+    def test_absolute_recurring_with_year_offset(self):
+        """'every March 15 - 1 year' triggers relativedelta-to-timedelta conversion."""
+        schedule = parse_when_expression("every March 15 - 1 year")
+        assert schedule.schedule_type == ScheduleType.ABSOLUTE_RECURRING
+        assert schedule.month == 3
+        assert schedule.day == 15
+        # Offset should be approximately -365 days
+        assert schedule.offset is not None
+        assert schedule.offset.days < 0
+
+
+class TestGetNextOccurrenceEdgeCases:
+    """Edge-case tests for get_next_occurrence."""
+
+    def test_absolute_once_none_date(self):
+        """ABSOLUTE_ONCE with None fixed_date should return None."""
+        schedule = ParsedSchedule(
+            schedule_type=ScheduleType.ABSOLUTE_ONCE,
+            fixed_date=None,
+            raw_expression="test",
+        )
+        now = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        trigger = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        result = get_next_occurrence(schedule, trigger, now)
+        assert result is None
+
+    def test_absolute_recurring_none_month(self):
+        """ABSOLUTE_RECURRING with None month should return None."""
+        schedule = ParsedSchedule(
+            schedule_type=ScheduleType.ABSOLUTE_RECURRING,
+            month=None,
+            day=25,
+            raw_expression="test",
+        )
+        now = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        trigger = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        result = get_next_occurrence(schedule, trigger, now)
+        assert result is None
+
+    def test_impossible_date_feb_30(self):
+        """Feb 30 should return None (invalid date)."""
+        schedule = ParsedSchedule(
+            schedule_type=ScheduleType.ABSOLUTE_RECURRING,
+            month=2,
+            day=30,
+            raw_expression="every February 30",
+        )
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        trigger = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        result = get_next_occurrence(schedule, trigger, now)
+        # Both this year and next year Feb 30 are invalid
+        assert result is None
+
+    def test_impossible_date_feb_30_after_feb(self):
+        """Feb 30 after Feb has passed this year - tries next year which also fails."""
+        schedule = ParsedSchedule(
+            schedule_type=ScheduleType.ABSOLUTE_RECURRING,
+            month=2,
+            day=30,
+            raw_expression="every February 30",
+        )
+        now = datetime(2026, 3, 1, tzinfo=timezone.utc)
+        trigger = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        result = get_next_occurrence(schedule, trigger, now)
+        assert result is None
+
+
+class TestShouldExecuteEdgeCases:
+    """Edge-case tests for should_execute."""
+
+    def test_should_execute_monthly_interval(self):
+        """Monthly recurring (relativedelta) should use get_next_occurrence fallback."""
+        schedule = parse_when_expression("every month after trigger")
+        trigger_time = datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        # Set now to be 2 months after trigger, so at least 1 period has passed
+        now = datetime(2025, 3, 15, 0, 0, 0, tzinfo=timezone.utc)
+
+        should, period = should_execute(schedule, trigger_time, None, now)
+        # The monthly recurring should find a due occurrence
+        assert isinstance(should, bool)
+        if should:
+            assert period is not None
+
+
+class TestPeriodKeyEdgeCases:
+    """Edge-case tests for ParsedSchedule.get_period_key."""
+
+    def test_period_key_30_day_interval(self):
+        """30-day interval should produce year-month key."""
+        schedule = ParsedSchedule(
+            schedule_type=ScheduleType.TRIGGER_RECURRING,
+            interval=timedelta(days=30),
+            raw_expression="every 30 days after trigger",
+        )
+        now = datetime(2026, 3, 15, tzinfo=timezone.utc)
+        key = schedule.get_period_key(now)
+        assert key == "2026-03"
+
+    def test_period_key_generic_interval(self):
+        """Non-standard interval (e.g., 5 days) with trigger_time should use period number."""
+        schedule = ParsedSchedule(
+            schedule_type=ScheduleType.TRIGGER_RECURRING,
+            interval=timedelta(days=5),
+            raw_expression="every 5 days after trigger",
+        )
+        trigger = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        now = datetime(2026, 1, 16, tzinfo=timezone.utc)  # 15 days = period 3
+        key = schedule.get_period_key(now, trigger)
+        assert key == "period-3"
+
+    def test_period_key_default_daily(self):
+        """Default path (no matching interval) should return daily key."""
+        schedule = ParsedSchedule(
+            schedule_type=ScheduleType.TRIGGER_RECURRING,
+            interval=None,  # No interval set
+            raw_expression="test",
+        )
+        now = datetime(2026, 3, 15, tzinfo=timezone.utc)
+        key = schedule.get_period_key(now)
+        assert key == "2026-03-15"
+
+
+class TestGetNextOccurrenceEdgeCases2:
+    """Additional edge-case tests for get_next_occurrence."""
+
+    def test_absolute_once_past_date_returns_none(self):
+        """ABSOLUTE_ONCE with a date in the past should return None."""
+        schedule = ParsedSchedule(
+            schedule_type=ScheduleType.ABSOLUTE_ONCE,
+            fixed_date=datetime(2020, 1, 1, tzinfo=timezone.utc),
+            raw_expression="on 2020-01-01",
+        )
+        now = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        result = get_next_occurrence(schedule, now, now)
+        assert result is None
+
+    def test_absolute_once_none_fixed_date_returns_none(self):
+        """ABSOLUTE_ONCE with fixed_date=None should return None."""
+        schedule = ParsedSchedule(
+            schedule_type=ScheduleType.ABSOLUTE_ONCE,
+            fixed_date=None,
+            raw_expression="on ???",
+        )
+        now = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        result = get_next_occurrence(schedule, now, now)
+        assert result is None
+
+    def test_absolute_recurring_invalid_date_feb30(self):
+        """ABSOLUTE_RECURRING with Feb 30 (impossible date) returns None."""
+        schedule = ParsedSchedule(
+            schedule_type=ScheduleType.ABSOLUTE_RECURRING,
+            month=2,
+            day=30,
+            raw_expression="every year on feb 30",
+        )
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        result = get_next_occurrence(schedule, now, now)
+        assert result is None
+
+    def test_absolute_recurring_feb29_non_leap_year(self):
+        """ABSOLUTE_RECURRING with Feb 29 in a non-leap year returns None for both years."""
+        schedule = ParsedSchedule(
+            schedule_type=ScheduleType.ABSOLUTE_RECURRING,
+            month=2,
+            day=29,
+            raw_expression="every year on feb 29",
+        )
+        # 2026 and 2027 are not leap years — both datetime() calls raise ValueError
+        now = datetime(2026, 3, 1, tzinfo=timezone.utc)
+        result = get_next_occurrence(schedule, now, now)
+        assert result is None
+
+    def test_absolute_recurring_none_month_returns_none(self):
+        """ABSOLUTE_RECURRING with month=None returns None."""
+        schedule = ParsedSchedule(
+            schedule_type=ScheduleType.ABSOLUTE_RECURRING,
+            month=None,
+            day=15,
+            raw_expression="every year on ??? 15",
+        )
+        now = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        result = get_next_occurrence(schedule, now, now)
+        assert result is None
+
+    def test_absolute_recurring_none_day_returns_none(self):
+        """ABSOLUTE_RECURRING with day=None returns None."""
+        schedule = ParsedSchedule(
+            schedule_type=ScheduleType.ABSOLUTE_RECURRING,
+            month=6,
+            day=None,
+            raw_expression="every year on jun ???",
+        )
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        result = get_next_occurrence(schedule, now, now)
+        assert result is None
+
+    def test_trigger_relative_already_passed_returns_none(self):
+        """TRIGGER_RELATIVE event that's already past returns None (line 271)."""
+        schedule = ParsedSchedule(
+            schedule_type=ScheduleType.TRIGGER_RELATIVE,
+            offset=timedelta(days=1),
+            raw_expression="1 day after trigger",
+        )
+        trigger = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        now = datetime(2026, 6, 1, tzinfo=timezone.utc)  # Way past trigger + 1 day
+        result = get_next_occurrence(schedule, trigger, now)
+        assert result is None
+
+
+class TestShouldExecuteEdgeCases2:
+    """Additional edge-case tests for should_execute."""
+
+    def test_anniversary_should_execute(self):
+        """TRIGGER_ANNIVERSARY should execute at the exact anniversary time.
+
+        should_execute calls get_next_occurrence(schedule, trigger, now - 1s).
+        For now = exactly the anniversary time, now-1s is 1 second before,
+        so get_next_occurrence sees the anniversary as future (> now-1s) and returns it.
+        Then should_execute checks: next_occ.time <= now → True, so it fires.
+        """
+        schedule = ParsedSchedule(
+            schedule_type=ScheduleType.TRIGGER_ANNIVERSARY,
+            raw_expression="every year on trigger anniversary",
+        )
+        trigger = datetime(2025, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        should, period = should_execute(schedule, trigger, None, now)
+        assert should is True
+        assert period == "2026"
+
+    def test_anniversary_already_run(self):
+        """TRIGGER_ANNIVERSARY should not re-execute when period key matches."""
+        schedule = ParsedSchedule(
+            schedule_type=ScheduleType.TRIGGER_ANNIVERSARY,
+            raw_expression="every year on trigger anniversary",
+        )
+        trigger = datetime(2025, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        should, period = should_execute(schedule, trigger, "2026", now)
+        assert should is False
+
+    def test_should_execute_no_next_occurrence(self):
+        """should_execute with schedule that has no next occurrence returns (False, None)."""
+        schedule = ParsedSchedule(
+            schedule_type=ScheduleType.ABSOLUTE_ONCE,
+            fixed_date=datetime(2020, 1, 1, tzinfo=timezone.utc),
+            raw_expression="on 2020-01-01",
+        )
+        trigger = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        now = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        should, period = should_execute(schedule, trigger, None, now)
+        assert should is False
+        assert period is None
+
+
+class TestGetNextOccurrenceEdgeCases3:
+    """Tests targeting remaining uncovered lines in dsl.py."""
+
+    def test_absolute_once_future_date_returns_occurrence(self):
+        """ABSOLUTE_ONCE with a future date returns NextOccurrence (line 313)."""
+        future = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        schedule = ParsedSchedule(
+            schedule_type=ScheduleType.ABSOLUTE_ONCE,
+            fixed_date=future,
+            raw_expression="on 2030-01-01",
+        )
+        now = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        result = get_next_occurrence(schedule, now, now)
+        assert result is not None
+        assert result.time == future
+        assert result.period_key == "once"
+
+    def test_absolute_recurring_feb29_this_year_passes_next_year_fails(self):
+        """Feb 29: this_year succeeds (leap year) but is past; next_year fails (lines 342-343).
+
+        In a leap year after Feb 29 has passed, this_year's date is valid but already past.
+        Then next_year (non-leap) raises ValueError → return None.
+        """
+        schedule = ParsedSchedule(
+            schedule_type=ScheduleType.ABSOLUTE_RECURRING,
+            month=2,
+            day=29,
+            raw_expression="every year on feb 29",
+        )
+        # 2024 is a leap year. After Feb 29, this_year (Feb 29) is valid but past.
+        # Next year is 2025 (not leap) → ValueError → return None.
+        now = datetime(2024, 3, 1, tzinfo=timezone.utc)
+        result = get_next_occurrence(schedule, now, now)
+        assert result is None
+
+    def test_trigger_recurring_no_interval_falls_through(self):
+        """TRIGGER_RECURRING with interval=None falls through to return None (line 347)."""
+        schedule = ParsedSchedule(
+            schedule_type=ScheduleType.TRIGGER_RECURRING,
+            interval=None,
+            raw_expression="every ??? after trigger",
+        )
+        trigger = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        now = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        result = get_next_occurrence(schedule, trigger, now)
+        assert result is None

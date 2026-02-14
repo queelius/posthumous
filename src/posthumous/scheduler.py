@@ -123,6 +123,7 @@ class Scheduler:
             last_checkin=self.state.last_checkin,
             trigger_time=self.state.trigger_time,
             trigger_at=self.config.trigger_at,
+            base_url=self.config.get_base_url(),
         )
         context["schedule_item"] = item.name
         context["period_key"] = period_key

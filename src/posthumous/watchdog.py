@@ -14,6 +14,23 @@ from posthumous.state import State, StateManager, Status
 logger = logging.getLogger(__name__)
 
 
+def _format_duration(td: timedelta) -> str:
+    """Format a timedelta into a human-readable string using the most meaningful units."""
+    total = int(td.total_seconds())
+    if total < 0:
+        return "0s"
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, seconds = divmod(rem, 60)
+    if days > 0:
+        return f"{days}d {hours}h" if hours else f"{days}d"
+    if hours > 0:
+        return f"{hours}h {minutes}m" if minutes else f"{hours}h"
+    if minutes > 0:
+        return f"{minutes}m {seconds}s" if seconds else f"{minutes}m"
+    return f"{seconds}s"
+
+
 @dataclass
 class TimeRemaining:
     """Information about time remaining until next transition."""
@@ -32,24 +49,17 @@ class TimeRemaining:
         if self.since_checkin is None:
             return "Never checked in"
 
-        days = self.since_checkin.days
-        hours = int(self.since_checkin.total_seconds() // 3600) % 24
-
         if self.status == Status.ARMED:
             if self.until_warning:
-                warn_days = self.until_warning.days
-                warn_hours = int(self.until_warning.total_seconds() // 3600) % 24
-                return f"ARMED - {warn_days}d {warn_hours}h until warning"
+                return f"ARMED - {_format_duration(self.until_warning)} until warning"
             return "ARMED"
         elif self.status == Status.WARNING:
             if self.until_grace:
-                grace_hours = int(self.until_grace.total_seconds() // 3600)
-                return f"WARNING - {grace_hours}h until grace period"
+                return f"WARNING - {_format_duration(self.until_grace)} until grace period"
             return "WARNING"
         elif self.status == Status.GRACE:
             if self.until_trigger:
-                trigger_hours = int(self.until_trigger.total_seconds() // 3600)
-                return f"GRACE - {trigger_hours}h until trigger"
+                return f"GRACE - {_format_duration(self.until_trigger)} until trigger"
             return "GRACE"
 
         return str(self.status.value).upper()
@@ -81,7 +91,17 @@ class Watchdog:
         self._on_trigger = on_trigger
         self._task: asyncio.Task | None = None
         self._running = False
-        self._check_interval = 60.0  # Check every minute
+
+        # Auto-tune check interval based on timing thresholds
+        if config.check_interval:
+            self._check_interval = config.check_interval.total_seconds()
+        else:
+            min_interval = min(
+                config.warning_start,
+                config.grace_start - config.warning_start,
+                config.trigger_at - config.grace_start,
+            ).total_seconds()
+            self._check_interval = max(1.0, min(60.0, min_interval / 4))
 
     @property
     def state(self) -> State:
@@ -93,9 +113,10 @@ class Watchdog:
         state = self.state
 
         if state.status == Status.TRIGGERED:
+            since = (now - state.last_checkin) if state.last_checkin else None
             return TimeRemaining(
                 status=Status.TRIGGERED,
-                since_checkin=None,
+                since_checkin=since,
                 until_warning=None,
                 until_grace=None,
                 until_trigger=None,
@@ -109,7 +130,7 @@ class Watchdog:
                 until_warning=None,
                 until_grace=None,
                 until_trigger=None,
-                is_overdue=True,
+                is_overdue=state.status != Status.ARMED,
             )
 
         since = now - state.last_checkin
@@ -268,25 +289,16 @@ def format_time_remaining(tr: TimeRemaining) -> str:
     lines = [f"Status: {tr.status.value.upper()}"]
 
     if tr.since_checkin:
-        days = tr.since_checkin.days
-        hours = int(tr.since_checkin.total_seconds() // 3600) % 24
-        minutes = int(tr.since_checkin.total_seconds() // 60) % 60
-        lines.append(f"Since last check-in: {days}d {hours}h {minutes}m")
+        lines.append(f"Since last check-in: {_format_duration(tr.since_checkin)}")
 
     if tr.until_warning:
-        days = tr.until_warning.days
-        hours = int(tr.until_warning.total_seconds() // 3600) % 24
-        lines.append(f"Until warning: {days}d {hours}h")
+        lines.append(f"Until warning: {_format_duration(tr.until_warning)}")
 
     if tr.until_grace:
-        hours = int(tr.until_grace.total_seconds() // 3600)
-        minutes = int(tr.until_grace.total_seconds() // 60) % 60
-        lines.append(f"Until grace: {hours}h {minutes}m")
+        lines.append(f"Until grace: {_format_duration(tr.until_grace)}")
 
     if tr.until_trigger:
-        hours = int(tr.until_trigger.total_seconds() // 3600)
-        minutes = int(tr.until_trigger.total_seconds() // 60) % 60
-        lines.append(f"Until trigger: {hours}h {minutes}m")
+        lines.append(f"Until trigger: {_format_duration(tr.until_trigger)}")
 
     if tr.is_overdue:
         lines.append("⚠ Check-in overdue!")

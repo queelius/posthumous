@@ -423,3 +423,104 @@ class TestCreateExampleScript:
 
         assert (config_dir / "scripts").is_dir()
         assert path.exists()
+
+
+class TestScriptRunnerEdgeCases:
+    """Edge-case tests for uncovered ScriptRunner paths."""
+
+    @pytest.mark.asyncio
+    async def test_run_interpreter_not_found(self, tmp_path):
+        """FileNotFoundError from subprocess should be caught gracefully."""
+        from unittest.mock import patch, AsyncMock
+
+        config_dir = tmp_path / "config"
+        config_dir.mkdir()
+        runner = ScriptRunner(config_dir)
+
+        # Create a Python script that exists
+        script_path = config_dir / "test.py"
+        script_path.write_text("print('hello')")
+
+        ctx = make_context()
+
+        # Patch create_subprocess_exec to raise FileNotFoundError
+        with patch('asyncio.create_subprocess_exec', side_effect=FileNotFoundError("python not found")):
+            result = await runner.run("test.py", ctx)
+
+        assert not result.success
+        assert "Failed to execute script" in result.error
+
+    @pytest.mark.asyncio
+    async def test_run_generic_exception(self, tmp_path):
+        """Unexpected exception during run() should be caught."""
+        from unittest.mock import patch
+
+        config_dir = tmp_path / "config"
+        config_dir.mkdir()
+        runner = ScriptRunner(config_dir)
+
+        # Create a script
+        script_path = config_dir / "test.py"
+        script_path.write_text("print('hello')")
+
+        ctx = make_context()
+
+        # Patch NamedTemporaryFile to raise a generic exception
+        with patch('tempfile.NamedTemporaryFile', side_effect=PermissionError("cannot write")):
+            result = await runner.run("test.py", ctx)
+
+        assert not result.success
+        assert "cannot write" in result.error
+
+    @pytest.mark.asyncio
+    async def test_run_multiple_parallel(self, tmp_path):
+        """Explicit parallel=True test for run_multiple."""
+        config_dir = tmp_path / "config"
+        (config_dir / "scripts").mkdir(parents=True)
+        runner = ScriptRunner(config_dir)
+
+        # Create two simple Python scripts
+        for name in ["a.py", "b.py"]:
+            script_path = config_dir / "scripts" / name
+            script_path.write_text("import sys; sys.exit(0)")
+
+        ctx = make_context()
+        results = await runner.run_multiple(
+            ["scripts/a.py", "scripts/b.py"],
+            ctx,
+            parallel=True,
+        )
+
+        assert len(results) == 2
+        assert all(r.success for r in results)
+
+    @pytest.mark.asyncio
+    async def test_context_file_cleanup_oserror(self, tmp_path):
+        """OSError during context file cleanup should be silently ignored (lines 249-250)."""
+        from unittest.mock import patch
+
+        config_dir = tmp_path / "config"
+        config_dir.mkdir()
+        runner = ScriptRunner(config_dir)
+
+        # Create a script that exits immediately
+        script_path = config_dir / "test.sh"
+        script_path.write_text("#!/bin/sh\nexit 0\n")
+        script_path.chmod(0o755)
+
+        ctx = make_context()
+
+        # Patch os.unlink to raise OSError during cleanup
+        original_unlink = os.unlink
+
+        def selective_unlink(path):
+            path_str = str(path)
+            if "posthumous_context" in path_str:
+                raise OSError("permission denied")
+            return original_unlink(path)
+
+        with patch('os.unlink', side_effect=selective_unlink):
+            result = await runner.run("test.sh", ctx)
+
+        # Script should still succeed despite cleanup failure
+        assert result.success

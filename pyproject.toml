@@ -34,6 +34,7 @@ dependencies = [
     "aiohttp>=3.9",
     "python-dateutil>=2.8",
     "qrcode>=7.4",
+    "cryptography>=41.0",
 ]
 
 [project.optional-dependencies]
@@ -55,11 +56,12 @@ packages = ["src/posthumous"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-addopts = "-v --cov=src/posthumous --cov-report=term-missing"
+addopts = "-v --cov=src/posthumous --cov-branch --cov-report=term-missing"
 
 [tool.coverage.run]
 source = ["src/posthumous"]
 branch = true
+parallel = true
 
 [tool.coverage.report]
 exclude_lines = [

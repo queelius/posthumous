@@ -1007,3 +1007,76 @@ class TestPeerHealthMonitoring:
         assert call_count[0] >= 2
 
         await manager.close()
+
+
+class TestPeerEdgeCases:
+    """Edge-case tests for uncovered PeerManager paths."""
+
+    @pytest.fixture
+    def config(self):
+        return Config(
+            node_name="test",
+            secret_key="JBSWY3DPEHPK3PXP",
+            peers=["http://peer1:8420"],
+            peer_check_interval=timedelta(seconds=30),
+            peer_down_threshold=timedelta(hours=6),
+        )
+
+    @pytest.fixture
+    def state_manager(self, tmp_path):
+        return StateManager(tmp_path / "state.yaml")
+
+    @pytest.mark.asyncio
+    async def test_get_peer_status_parsing_error(self, config, state_manager):
+        """KeyError/ValueError in response should return a PeerStatus with error."""
+        from aioresponses import aioresponses
+
+        manager = PeerManager(config, state_manager)
+
+        with aioresponses() as m:
+            # Return a malformed response that causes parsing error
+            m.get(
+                "http://peer1:8420/status",
+                payload={
+                    "last_checkin": "not-a-valid-datetime",
+                },
+            )
+            status = await manager.get_peer_status("http://peer1:8420")
+
+        assert status.reachable is True
+        assert status.error is not None
+        assert "Invalid response" in status.error
+
+        await manager.close()
+
+    @pytest.mark.asyncio
+    async def test_sync_state_apply_exception(self, config, state_manager):
+        """Exception during state apply should return False."""
+        from aioresponses import aioresponses
+
+        manager = PeerManager(config, state_manager)
+
+        # Set up a successful peer that has reachable status
+        with aioresponses() as m:
+            m.get(
+                "http://peer1:8420/status",
+                payload={
+                    "status": "armed",
+                    "last_checkin": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            # Return state data that will cause an exception during apply
+            m.get(
+                "http://peer1:8420/sync/state",
+                payload={
+                    "status": "invalid-status-value-that-will-cause-exception",
+                    "last_checkin": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+
+            result = await manager.sync_state_from_peers()
+
+        # Should return False because Status("invalid-status-value...") raises ValueError
+        assert result is False
+
+        await manager.close()

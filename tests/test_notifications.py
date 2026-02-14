@@ -134,6 +134,75 @@ class TestBuildContext:
         # Should show 0 when past deadline
         assert context["days_left"] == 0
 
+    def test_context_with_base_url(self):
+        context = build_context(
+            node_name="test",
+            status="armed",
+            base_url="https://example.com:8420",
+        )
+
+        assert context["base_url"] == "https://example.com:8420"
+        assert context["checkin_url"] == "https://example.com:8420/checkin"
+        assert context["dashboard_url"] == "https://example.com:8420/dashboard"
+
+    def test_context_with_base_url_trailing_slash(self):
+        context = build_context(
+            node_name="test",
+            status="armed",
+            base_url="https://example.com:8420/",
+        )
+
+        assert context["base_url"] == "https://example.com:8420"
+        assert context["checkin_url"] == "https://example.com:8420/checkin"
+
+    def test_context_without_base_url(self):
+        context = build_context(
+            node_name="test",
+            status="armed",
+        )
+
+        assert "base_url" not in context
+        assert "checkin_url" not in context
+        assert "dashboard_url" not in context
+
+    def test_context_with_base_url_none(self):
+        context = build_context(
+            node_name="test",
+            status="armed",
+            base_url=None,
+        )
+
+        assert "checkin_url" not in context
+
+    def test_url_variables_render_in_message(self):
+        manager = NotificationManager({})
+        context = build_context(
+            node_name="test",
+            status="warning",
+            base_url="https://phm.example.com",
+        )
+        result = manager.format_message(
+            "Check in: {checkin_url}", context
+        )
+        assert result == "Check in: https://phm.example.com/checkin"
+
+    def test_url_variables_in_full_message(self):
+        manager = NotificationManager({})
+        now = datetime.now(timezone.utc)
+        context = build_context(
+            node_name="mynode",
+            status="warning",
+            last_checkin=now - timedelta(days=5),
+            trigger_at=timedelta(days=14),
+            base_url="http://localhost:8420",
+        )
+        result = manager.format_message(
+            "Check-in needed. {days_left} days left.\n\nCheck in: {checkin_url}",
+            context,
+        )
+        assert "http://localhost:8420/checkin" in result
+        assert "days left" in result
+
 
 class TestNotificationSending:
     """Tests for actual notification sending."""

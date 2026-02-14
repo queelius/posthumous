@@ -93,16 +93,24 @@ class State:
         return config_dir / "state.yaml"
 
     @classmethod
-    def load(cls, path: Path | str) -> State:
-        """Load state from a YAML file."""
+    def load(cls, path: Path | str, encryption_key: bytes | None = None) -> State:
+        """Load state from a YAML file.
+
+        If encryption_key is provided, transparently decrypts encrypted files.
+        Plaintext files are read normally (migration support).
+        """
         path = Path(path)
 
         if not path.exists():
             return cls()
 
         try:
-            with open(path) as f:
-                data = yaml.safe_load(f) or {}
+            if encryption_key:
+                from posthumous.crypto import decrypt_file
+                content = decrypt_file(path, encryption_key)
+            else:
+                content = path.read_text()
+            data = yaml.safe_load(content) or {}
             return cls.from_dict(data)
         except (yaml.YAMLError, KeyError, ValueError) as e:
             # Corrupt state file - return fresh state
@@ -196,35 +204,41 @@ class State:
             'last_modified': format_datetime(datetime.now(timezone.utc)),
         }
 
-    def save(self, path: Path | str) -> None:
+    def save(self, path: Path | str, encryption_key: bytes | None = None) -> None:
         """Save state atomically to a YAML file.
 
         Uses write-to-temp-file + rename pattern for atomicity.
+        If encryption_key is provided, encrypts the content before writing.
         """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
 
         self.last_modified = datetime.now(timezone.utc)
         data = self.to_dict()
+        content = yaml.dump(data, default_flow_style=False, sort_keys=False)
 
-        # Write to temp file in same directory (for atomic rename)
-        fd, temp_path = tempfile.mkstemp(
-            dir=path.parent,
-            prefix='.state_',
-            suffix='.yaml.tmp'
-        )
-        try:
-            with os.fdopen(fd, 'w') as f:
-                yaml.dump(data, f, default_flow_style=False, sort_keys=False)
-            # Atomic rename
-            os.replace(temp_path, path)
-        except Exception:
-            # Clean up temp file on error
+        if encryption_key:
+            from posthumous.crypto import save_encrypted
+            save_encrypted(path, content, encryption_key)
+        else:
+            # Write to temp file in same directory (for atomic rename)
+            fd, temp_path = tempfile.mkstemp(
+                dir=path.parent,
+                prefix='.state_',
+                suffix='.yaml.tmp'
+            )
             try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
-            raise
+                with os.fdopen(fd, 'w') as f:
+                    f.write(content)
+                # Atomic rename
+                os.replace(temp_path, path)
+            except Exception:
+                # Clean up temp file on error
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+                raise
 
     def record_checkin(self, timestamp: datetime | None = None) -> None:
         """Record a successful check-in."""
@@ -333,8 +347,9 @@ class StateCorruptError(Exception):
 class StateManager:
     """Manages state persistence with automatic saving."""
 
-    def __init__(self, path: Path | str):
+    def __init__(self, path: Path | str, encryption_key: bytes | None = None):
         self.path = Path(path)
+        self.encryption_key = encryption_key
         self._state: State | None = None
 
     @property
@@ -342,7 +357,7 @@ class StateManager:
         """Get the current state, loading if necessary."""
         if self._state is None:
             try:
-                self._state = State.load(self.path)
+                self._state = State.load(self.path, self.encryption_key)
             except StateCorruptError:
                 self._state = State()
         return self._state
@@ -350,7 +365,7 @@ class StateManager:
     def save(self) -> None:
         """Save the current state."""
         if self._state is not None:
-            self._state.save(self.path)
+            self._state.save(self.path, self.encryption_key)
 
     def checkin(self, timestamp: datetime | None = None) -> None:
         """Record a check-in and save state."""

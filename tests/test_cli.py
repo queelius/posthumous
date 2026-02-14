@@ -672,3 +672,295 @@ class TestTestNotifyExtended:
 
         assert result.exit_code == 0
         assert "default" in result.output
+
+
+class TestCheckinAuthError:
+    """Test checkin with AuthError (not LockedOutError)."""
+
+    def test_checkin_auth_error(self, runner, valid_config_dir, config_path):
+        """AuthError (e.g., no code and no token) should show error and exit 1."""
+        from posthumous.auth import AuthError
+
+        with patch('posthumous.auth.Authenticator.verify', side_effect=AuthError("No code or token")):
+            result = runner.invoke(
+                main, ['-c', str(config_path), 'checkin'],
+                input="123456\n",
+            )
+
+        assert result.exit_code == 1
+        assert "No code or token" in result.output
+
+    @pytest.fixture
+    def runner(self):
+        return CliRunner()
+
+    @pytest.fixture
+    def valid_config_dir(self, tmp_path):
+        config_dir = tmp_path / ".posthumous"
+        config_dir.mkdir()
+        (config_dir / "scripts").mkdir()
+        (config_dir / "logs").mkdir()
+        config_path = config_dir / "config.yaml"
+        config_path.write_text(
+            "node_name: test-node\n"
+            f"secret_key: {SECRET}\n"
+            "listen: '127.0.0.1:8420'\n"
+            "checkin_interval: 7 days\n"
+            "warning_start: 8 days\n"
+            "grace_start: 12 days\n"
+            "trigger_at: 14 days\n"
+        )
+        return config_dir
+
+    @pytest.fixture
+    def config_path(self, valid_config_dir):
+        return valid_config_dir / "config.yaml"
+
+
+class TestPeersCommandWithPeers:
+    """Test peers command when peers are configured."""
+
+    @pytest.fixture
+    def runner(self):
+        return CliRunner()
+
+    def test_peers_command_with_peers(self, runner, tmp_path):
+        """peers command should show peer status when peers configured."""
+        config_dir = tmp_path / ".posthumous"
+        config_dir.mkdir()
+        (config_dir / "scripts").mkdir()
+        (config_dir / "logs").mkdir()
+        config_path = config_dir / "config.yaml"
+        config_path.write_text(
+            "node_name: test-node\n"
+            f"secret_key: {SECRET}\n"
+            "listen: '127.0.0.1:8420'\n"
+            "checkin_interval: 7 days\n"
+            "warning_start: 8 days\n"
+            "grace_start: 12 days\n"
+            "trigger_at: 14 days\n"
+            "peers:\n"
+            "  - http://localhost:18421\n"
+        )
+
+        from aioresponses import aioresponses
+
+        with aioresponses() as m:
+            m.get(
+                "http://localhost:18421/status",
+                payload={
+                    "node_name": "peer1",
+                    "status": "armed",
+                    "last_checkin": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+
+            result = runner.invoke(
+                main, ['-c', str(config_path), 'peers'],
+            )
+
+        assert result.exit_code == 0
+        assert "Peers:" in result.output
+
+
+class TestInitQRImportError:
+    """Test init when qrcode package is not available."""
+
+    @pytest.fixture
+    def runner(self):
+        return CliRunner()
+
+    def test_init_qr_import_error(self, runner, tmp_path):
+        """When qrcode is not installed, init should show a fallback message."""
+        config_path = tmp_path / "fresh" / "config.yaml"
+
+        with patch('posthumous.auth.generate_qr_code_terminal', side_effect=ImportError("No qrcode")):
+            result = runner.invoke(
+                main, ['-c', str(config_path), 'init', '--node-name', 'my-node'],
+            )
+
+        assert result.exit_code == 0
+        assert "qrcode" in result.output.lower() or "QR" in result.output
+
+    def test_import_restores_config_from_backup(self, runner, tmp_path):
+        """Import should restore config when no existing config and backup has config."""
+        import yaml
+
+        config_path = tmp_path / "new_dir" / "config.yaml"
+        backup_path = tmp_path / "backup.yaml"
+
+        backup_data = {
+            "config": {
+                "node_name": "restored-node",
+                "secret_key": SECRET,
+                "checkin_interval": "7 days",
+                "warning_start": "8 days",
+                "grace_start": "12 days",
+                "trigger_at": "14 days",
+            },
+            "state": {
+                "status": "armed",
+                "last_checkin": None,
+                "trigger_time": None,
+                "schedule_state": {},
+                "failed_attempts": [],
+                "peer_states": {},
+            },
+        }
+        with open(backup_path, "w") as f:
+            yaml.dump(backup_data, f)
+
+        result = runner.invoke(
+            main, ['-c', str(config_path), 'import', str(backup_path)],
+        )
+
+        assert result.exit_code == 0
+        assert "Config restored" in result.output
+        assert config_path.exists()
+
+    def test_import_no_config_and_no_backup_config(self, runner, tmp_path):
+        """Import should fail when no existing config and backup has no config."""
+        import yaml
+
+        config_path = tmp_path / "new_dir" / "config.yaml"
+        backup_path = tmp_path / "backup.yaml"
+
+        backup_data = {
+            "state": {
+                "status": "armed",
+                "last_checkin": None,
+            },
+        }
+        with open(backup_path, "w") as f:
+            yaml.dump(backup_data, f)
+
+        result = runner.invoke(
+            main, ['-c', str(config_path), 'import', str(backup_path)],
+        )
+
+        assert result.exit_code == 1
+        assert "No config in backup" in result.output
+
+
+class TestExportEncryption:
+    """Tests for export with encrypt_at_rest."""
+
+    def test_export_encrypt_at_rest_shows_decrypted_message(self, runner, tmp_path):
+        """Export with encrypt_at_rest=True should show '(decrypted)' message."""
+        config_dir = tmp_path / ".posthumous"
+        config_dir.mkdir()
+        (config_dir / "scripts").mkdir()
+        (config_dir / "logs").mkdir()
+
+        config_path = config_dir / "config.yaml"
+        config_path.write_text(
+            "node_name: test-node\n"
+            f"secret_key: {SECRET}\n"
+            "listen: '127.0.0.1:8420'\n"
+            "checkin_interval: 7 days\n"
+            "warning_start: 8 days\n"
+            "grace_start: 12 days\n"
+            "trigger_at: 14 days\n"
+            "encrypt_at_rest: true\n"
+        )
+
+        # Create state file (plaintext is fine — StateManager handles it)
+        state_path = config_dir / "state.yaml"
+        state_path.write_text("status: armed\nlast_checkin: null\n")
+
+        output_path = tmp_path / "backup.yaml"
+        result = runner.invoke(
+            main, ['-c', str(config_path), 'export', str(output_path)],
+        )
+
+        assert result.exit_code == 0
+        assert "(decrypted)" in result.output
+
+
+class TestReset:
+    """Tests for the 'reset' command (Issue 9)."""
+
+    def test_reset_from_triggered(self, runner, valid_config_dir, config_path):
+        """Reset from TRIGGERED with --force should succeed."""
+        from posthumous.state import State, Status
+
+        state = State()
+        state.status = Status.TRIGGERED
+        state.trigger_time = datetime.now(timezone.utc)
+        state.save(valid_config_dir / "state.yaml")
+
+        result = runner.invoke(
+            main, ['-c', str(config_path), 'reset', '--force'],
+        )
+
+        assert result.exit_code == 0
+        assert "State reset to ARMED" in result.output
+
+    def test_reset_from_warning(self, runner, valid_config_dir, config_path):
+        """Reset from WARNING with --force should succeed."""
+        from posthumous.state import State, Status
+
+        state = State()
+        state.status = Status.WARNING
+        state.save(valid_config_dir / "state.yaml")
+
+        result = runner.invoke(
+            main, ['-c', str(config_path), 'reset', '--force'],
+        )
+
+        assert result.exit_code == 0
+        assert "State reset to ARMED" in result.output
+
+    def test_reset_already_armed(self, runner, config_path):
+        """Reset when already ARMED should report no change."""
+        result = runner.invoke(
+            main, ['-c', str(config_path), 'reset'],
+        )
+
+        assert result.exit_code == 0
+        assert "Already ARMED" in result.output
+
+    def test_reset_requires_confirmation(self, runner, valid_config_dir, config_path):
+        """Reset from TRIGGERED without --force should prompt."""
+        from posthumous.state import State, Status
+
+        state = State()
+        state.status = Status.TRIGGERED
+        state.trigger_time = datetime.now(timezone.utc)
+        state.save(valid_config_dir / "state.yaml")
+
+        # Abort the prompt
+        result = runner.invoke(
+            main, ['-c', str(config_path), 'reset'],
+            input="n\n",
+        )
+
+        assert result.exit_code != 0  # Aborted
+
+    def test_reset_confirmed(self, runner, valid_config_dir, config_path):
+        """Reset from TRIGGERED with confirmation should succeed."""
+        from posthumous.state import State, Status
+
+        state = State()
+        state.status = Status.TRIGGERED
+        state.trigger_time = datetime.now(timezone.utc)
+        state.save(valid_config_dir / "state.yaml")
+
+        result = runner.invoke(
+            main, ['-c', str(config_path), 'reset'],
+            input="y\n",
+        )
+
+        assert result.exit_code == 0
+        assert "State reset to ARMED" in result.output
+
+    def test_reset_no_config(self, runner, tmp_path):
+        """Reset without config should fail."""
+        config_path = tmp_path / "missing.yaml"
+
+        result = runner.invoke(
+            main, ['-c', str(config_path), 'reset'],
+        )
+
+        assert result.exit_code == 1
+        assert "Config not found" in result.output

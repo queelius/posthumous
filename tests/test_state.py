@@ -395,3 +395,124 @@ class TestLockoutExtended:
         # These are outside the 15-minute window
         result = state.check_and_set_lockout(5, lockout_duration)
         assert result is False
+
+
+class TestStateEdgeCases:
+    """Edge-case tests for State class."""
+
+    def test_get_default_state_path_no_config_dir(self):
+        """None config_dir should default to ~/.posthumous/state.yaml."""
+        path = State.get_default_state_path(None)
+        assert path == Path.home() / ".posthumous" / "state.yaml"
+
+    def test_get_default_state_path_with_config_dir(self, tmp_path):
+        """Explicit config_dir should be used."""
+        path = State.get_default_state_path(tmp_path)
+        assert path == tmp_path / "state.yaml"
+
+    def test_record_checkin_with_explicit_timestamp(self):
+        """record_checkin with a specific timestamp should use that timestamp."""
+        state = State()
+        specific_time = datetime(2025, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        state.record_checkin(specific_time)
+        assert state.last_checkin == specific_time
+        assert state.status == Status.ARMED
+
+    def test_save_replace_fails_and_unlink_fails(self, tmp_path):
+        """When os.replace and os.unlink both fail, exception still propagates."""
+        from unittest.mock import patch
+
+        state = State()
+        state_path = tmp_path / "state.yaml"
+
+        # Patch os.replace to fail, and os.unlink to also fail (OSError)
+        with patch('os.replace', side_effect=OSError("replace failed")), \
+             patch('os.unlink', side_effect=OSError("unlink failed")):
+            with pytest.raises(OSError, match="replace failed"):
+                state.save(state_path)
+
+
+class TestStateEncryption:
+    """Tests for encrypted state save/load paths."""
+
+    def test_save_and_load_encrypted(self, tmp_path):
+        """State round-trips through encrypted save/load."""
+        from posthumous.crypto import derive_key
+
+        key = derive_key("test-secret")
+        state_path = tmp_path / "state.yaml"
+
+        state = State()
+        state.record_checkin()
+        state.save(state_path, encryption_key=key)
+
+        # File should be encrypted on disk
+        raw = state_path.read_bytes()
+        from posthumous.crypto import is_encrypted
+        assert is_encrypted(raw)
+
+        # Load back with encryption key
+        loaded = State.load(state_path, encryption_key=key)
+        assert loaded.status == Status.ARMED
+        assert loaded.last_checkin is not None
+
+    def test_load_plaintext_with_encryption_key(self, tmp_path):
+        """Loading a plaintext file with encryption_key should work (migration)."""
+        from posthumous.crypto import derive_key
+        import yaml
+
+        key = derive_key("test-secret")
+        state_path = tmp_path / "state.yaml"
+
+        # Write plaintext state
+        data = {"status": "armed", "last_checkin": None}
+        state_path.write_text(yaml.dump(data))
+
+        # Should load fine (decrypt_file handles plaintext transparently)
+        loaded = State.load(state_path, encryption_key=key)
+        assert loaded.status == Status.ARMED
+
+
+class TestFromDictBranchPartials:
+    """Tests for branch partials in State.from_dict — non-dict items skipped."""
+
+    def test_schedule_state_non_dict_item_skipped(self):
+        """Non-dict items in schedule_state should be silently skipped."""
+        data = {
+            "status": "armed",
+            "schedule_state": {
+                "good": {"last_run": None, "period": "2026"},
+                "bad": "not a dict",
+                "also_bad": 42,
+            },
+        }
+        state = State.from_dict(data)
+        assert "good" in state.schedule_state
+        assert "bad" not in state.schedule_state
+        assert "also_bad" not in state.schedule_state
+
+    def test_failed_attempts_non_dict_item_skipped(self):
+        """Non-dict items in failed_attempts should be silently skipped."""
+        data = {
+            "status": "armed",
+            "failed_attempts": [
+                {"timestamp": "2026-01-01T00:00:00+00:00", "source": "1.2.3.4"},
+                "not a dict",
+                42,
+            ],
+        }
+        state = State.from_dict(data)
+        assert len(state.failed_attempts) == 1
+
+    def test_peer_states_non_dict_item_skipped(self):
+        """Non-dict items in peer_states should be silently skipped."""
+        data = {
+            "status": "armed",
+            "peer_states": {
+                "http://good:8420": {"last_seen": None, "consecutive_failures": 0},
+                "http://bad:8420": "not a dict",
+            },
+        }
+        state = State.from_dict(data)
+        assert "http://good:8420" in state.peer_states
+        assert "http://bad:8420" not in state.peer_states

@@ -276,7 +276,7 @@ def run(ctx: click.Context, daemon: bool) -> None:
     logger = logging.getLogger(__name__)
 
     # Initialize components
-    state_manager = StateManager(config.config_dir / "state.yaml")
+    state_manager = StateManager(config.config_dir / "state.yaml", config.get_encryption_key())
     notification_manager = NotificationManager(config.notifications)
     script_runner = ScriptRunner(config.config_dir)
     authenticator = Authenticator(
@@ -308,6 +308,7 @@ def run(ctx: click.Context, daemon: bool) -> None:
             last_checkin=state_manager.state.last_checkin,
             trigger_time=trigger_time,
             trigger_at=config.trigger_at,
+            base_url=config.get_base_url(),
         )
 
         for action in actions:
@@ -427,7 +428,7 @@ def checkin(ctx: click.Context, token: str | None) -> None:
         sys.exit(1)
 
     config = Config.from_yaml(config_path)
-    state_manager = StateManager(config.config_dir / "state.yaml")
+    state_manager = StateManager(config.config_dir / "state.yaml", config.get_encryption_key())
 
     if state_manager.state.status == Status.TRIGGERED:
         click.echo("Node is already TRIGGERED. Check-in not possible.", err=True)
@@ -491,7 +492,7 @@ def status(ctx: click.Context) -> None:
         sys.exit(1)
 
     config = Config.from_yaml(config_path)
-    state_manager = StateManager(config.config_dir / "state.yaml")
+    state_manager = StateManager(config.config_dir / "state.yaml", config.get_encryption_key())
     watchdog = Watchdog(config, state_manager)
 
     state = state_manager.state
@@ -523,6 +524,40 @@ def status(ctx: click.Context) -> None:
 
 
 @main.command()
+@click.option('--force', is_flag=True, help='Skip confirmation prompt')
+@click.pass_context
+def reset(ctx: click.Context, force: bool) -> None:
+    """Reset state to ARMED (administrative recovery)."""
+    from posthumous.config import Config
+    from posthumous.state import StateManager, Status
+
+    config_path = ctx.obj.get('config_path') or Config.get_default_config_path()
+
+    if not config_path.exists():
+        click.echo(f"Config not found at {config_path}", err=True)
+        sys.exit(1)
+
+    config = Config.from_yaml(config_path)
+    state_manager = StateManager(config.config_dir / "state.yaml", config.get_encryption_key())
+    current = state_manager.state.status
+
+    if current == Status.ARMED:
+        click.echo("Already ARMED. Nothing to reset.")
+        return
+
+    if current == Status.TRIGGERED and not force:
+        click.confirm(
+            "Node is TRIGGERED. This is irreversible. Reset to ARMED?",
+            abort=True,
+        )
+    elif not force:
+        click.confirm(f"Reset from {current.value.upper()} to ARMED?", abort=True)
+
+    state_manager.reset()
+    click.echo("State reset to ARMED.")
+
+
+@main.command()
 @click.pass_context
 def peers(ctx: click.Context) -> None:
     """Show peer status."""
@@ -542,7 +577,7 @@ def peers(ctx: click.Context) -> None:
         click.echo("No peers configured.")
         return
 
-    state_manager = StateManager(config.config_dir / "state.yaml")
+    state_manager = StateManager(config.config_dir / "state.yaml", config.get_encryption_key())
     peer_manager = PeerManager(config, state_manager)
 
     async def check_peers():
@@ -625,9 +660,15 @@ def test_trigger(ctx: click.Context, dry_run: bool) -> None:
 
 @main.command()
 @click.argument('output', type=click.Path(path_type=Path))
+@click.option('--decrypt', is_flag=True, default=False,
+              help='Export in plaintext (default; decrypts encrypted state files).')
 @click.pass_context
-def export(ctx: click.Context, output: Path) -> None:
-    """Export state for backup."""
+def export(ctx: click.Context, output: Path, decrypt: bool) -> None:
+    """Export state for backup.
+
+    Always exports in plaintext YAML. If state is encrypted at rest,
+    it is transparently decrypted for the export.
+    """
     import yaml
     from posthumous.config import Config
     from posthumous.state import StateManager
@@ -639,7 +680,7 @@ def export(ctx: click.Context, output: Path) -> None:
         sys.exit(1)
 
     config = Config.from_yaml(config_path)
-    state_manager = StateManager(config.config_dir / "state.yaml")
+    state_manager = StateManager(config.config_dir / "state.yaml", config.get_encryption_key())
 
     data = {
         'config': config.to_dict(),
@@ -649,7 +690,10 @@ def export(ctx: click.Context, output: Path) -> None:
     with open(output, 'w') as f:
         yaml.dump(data, f, default_flow_style=False)
 
-    click.echo(f"Exported to {output}")
+    if config.encrypt_at_rest:
+        click.echo(f"Exported to {output} (decrypted)")
+    else:
+        click.echo(f"Exported to {output}")
 
 
 @main.command('import')

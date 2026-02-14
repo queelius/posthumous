@@ -9,7 +9,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from posthumous.auth import Authenticator, sign_message
 from posthumous.config import Config
-from posthumous.server import Server
+from posthumous.server import Server, _format_duration
 from posthumous.state import StateManager, Status
 
 
@@ -609,3 +609,361 @@ class TestSyncState:
         assert data["status"] == "triggered"
         assert data["last_checkin"] == checkin_time.isoformat()
         assert data["trigger_time"] == trigger_time.isoformat()
+
+
+class TestDashboard:
+    """Tests for GET /dashboard."""
+
+    @pytest.mark.asyncio
+    async def test_dashboard_returns_html(self, client):
+        resp = await client.get("/dashboard")
+
+        assert resp.status == 200
+        assert resp.content_type == "text/html"
+        text = await resp.text()
+        assert "Dashboard" in text
+        assert "test-node" in text
+        assert "ARMED" in text
+
+    @pytest.mark.asyncio
+    async def test_dashboard_shows_no_checkins(self, client):
+        resp = await client.get("/dashboard")
+        text = await resp.text()
+        assert "Never" in text
+        assert "No check-ins recorded" in text
+
+    @pytest.mark.asyncio
+    async def test_dashboard_with_recent_checkin(self, client, state_manager):
+        state_manager.state.last_checkin = datetime.now(timezone.utc) - timedelta(days=2, hours=3)
+        resp = await client.get("/dashboard")
+        text = await resp.text()
+        assert "Since check-in" in text
+        assert "2d 3h" in text
+
+    @pytest.mark.asyncio
+    async def test_dashboard_warning_status(self, client, state_manager):
+        state_manager.state.status = Status.WARNING
+        state_manager.state.last_checkin = datetime.now(timezone.utc) - timedelta(days=9)
+        resp = await client.get("/dashboard")
+        text = await resp.text()
+        assert "WARNING" in text
+        assert "warning" in text  # CSS class
+
+    @pytest.mark.asyncio
+    async def test_dashboard_triggered_shows_trigger_time(self, client, state_manager):
+        trigger_time = datetime(2026, 2, 10, 14, 30, 0, tzinfo=timezone.utc)
+        state_manager.state.status = Status.TRIGGERED
+        state_manager.state.trigger_time = trigger_time
+        state_manager.state.last_checkin = datetime.now(timezone.utc) - timedelta(days=30)
+        resp = await client.get("/dashboard")
+        text = await resp.text()
+        assert "TRIGGERED" in text
+        assert "2026-02-10 14:30 UTC" in text
+
+    @pytest.mark.asyncio
+    async def test_dashboard_no_peers(self, client):
+        resp = await client.get("/dashboard")
+        text = await resp.text()
+        assert "No peers configured" in text
+
+    @pytest.mark.asyncio
+    async def test_dashboard_with_peers(self, config, state_manager, watchdog, authenticator, peer_manager):
+        config.peers = ["http://peer1:8420", "http://peer2:8420"]
+        from posthumous.state import PeerState
+        state_manager.state.peer_states["http://peer1:8420"] = PeerState(
+            url="http://peer1:8420",
+            last_seen=datetime.now(timezone.utc) - timedelta(minutes=5),
+            consecutive_failures=0,
+        )
+        state_manager.state.peer_states["http://peer2:8420"] = PeerState(
+            url="http://peer2:8420",
+            last_error="Connection refused",
+        )
+        server = Server(config, state_manager, watchdog, authenticator, peer_manager)
+        async with TestClient(TestServer(server.app)) as test_client:
+            resp = await test_client.get("/dashboard")
+            text = await resp.text()
+            assert "peer1" in text
+            assert "peer2" in text
+            assert "Connection refused" in text
+
+    @pytest.mark.asyncio
+    async def test_dashboard_no_schedule(self, client):
+        resp = await client.get("/dashboard")
+        text = await resp.text()
+        assert "No post-trigger items configured" in text
+
+    @pytest.mark.asyncio
+    async def test_dashboard_with_schedule(self, config, state_manager, watchdog, authenticator, peer_manager):
+        from posthumous.config import ScheduledItem
+        config.post_trigger = [
+            ScheduledItem(name="annual-email", when="every year on Jan 1"),
+            ScheduledItem(name="weekly-check", when="every week"),
+        ]
+        state_manager.state.mark_schedule_item_run("annual-email", "2026")
+        server = Server(config, state_manager, watchdog, authenticator, peer_manager)
+        async with TestClient(TestServer(server.app)) as test_client:
+            resp = await test_client.get("/dashboard")
+            text = await resp.text()
+            assert "annual-email" in text
+            assert "weekly-check" in text
+            assert "never" in text  # weekly-check hasn't run
+
+    @pytest.mark.asyncio
+    async def test_dashboard_has_nav_links(self, client):
+        resp = await client.get("/dashboard")
+        text = await resp.text()
+        assert "/checkin" in text
+        assert "/dashboard" in text
+        assert "/status" in text
+
+    @pytest.mark.asyncio
+    async def test_dashboard_overdue(self, client, state_manager):
+        """Dashboard shows OVERDUE when past trigger deadline."""
+        state_manager.state.last_checkin = datetime.now(timezone.utc) - timedelta(days=30)
+        state_manager.state.status = Status.GRACE
+        resp = await client.get("/dashboard")
+        text = await resp.text()
+        assert "OVERDUE" in text
+
+
+class TestServerTimeInfoEdgeCases:
+    """Edge cases for _get_time_info and Server lifecycle."""
+
+    @pytest.fixture
+    def server(self, config, state_manager, authenticator, peer_manager):
+        from posthumous.watchdog import Watchdog
+        watchdog = Watchdog(config, state_manager)
+        return Server(config, state_manager, watchdog, authenticator, peer_manager)
+
+    def test_time_info_no_trigger_no_deadline(self, config, state_manager, server):
+        """_get_time_info when checkin exists but trigger is not approaching."""
+        # Set a recent checkin so until_trigger is still positive
+        state_manager.state.last_checkin = datetime.now(timezone.utc) - timedelta(days=1)
+        info = server._get_time_info()
+        assert "Last check-in:" in info
+        assert "Trigger in:" in info
+
+    def test_time_info_past_trigger_deadline(self, config, state_manager, server):
+        """_get_time_info when past the trigger deadline (until_trigger is None)."""
+        # Set checkin very far in the past
+        state_manager.state.last_checkin = datetime.now(timezone.utc) - timedelta(days=30)
+        info = server._get_time_info()
+        # until_trigger is None because we're past trigger threshold
+        assert "Last check-in:" in info
+        assert "Trigger in:" not in info
+
+    @pytest.mark.asyncio
+    async def test_server_start_stop_lifecycle(self, config, state_manager, authenticator, peer_manager):
+        """Server.start() then .stop() should work cleanly."""
+        from posthumous.watchdog import Watchdog
+        watchdog = Watchdog(config, state_manager)
+        server = Server(config, state_manager, watchdog, authenticator, peer_manager)
+
+        await server.start()
+        assert server._runner is not None
+
+        await server.stop()
+        assert server._runner is None
+
+    @pytest.mark.asyncio
+    async def test_server_stop_when_not_started(self, config, state_manager, authenticator, peer_manager):
+        """stop() with no runner should be a no-op."""
+        from posthumous.watchdog import Watchdog
+        watchdog = Watchdog(config, state_manager)
+        server = Server(config, state_manager, watchdog, authenticator, peer_manager)
+
+        assert server._runner is None
+        await server.stop()  # Should not raise
+        assert server._runner is None
+
+
+class TestServerPeerDisplay:
+    """Tests for peer status display in the web UI."""
+
+    @pytest.mark.asyncio
+    async def test_peer_unknown_status_in_checkin_page(self, tmp_path):
+        """Peer with no last_seen and no last_error shows 'unknown'."""
+        from posthumous.state import PeerState
+        from posthumous.peers import PeerManager
+        from posthumous.watchdog import Watchdog
+
+        config = Config(
+            node_name="test",
+            secret_key=SECRET,
+            peers=["http://peer1:8420"],
+        )
+        state_manager = StateManager(tmp_path / "state.yaml")
+        # Create a peer state with no last_seen and no last_error
+        state_manager.state.peer_states["http://peer1:8420"] = PeerState(
+            url="http://peer1:8420",
+            last_seen=None,
+            last_error=None,
+            consecutive_failures=0,
+        )
+
+        authenticator = Authenticator(config)
+        peer_manager = PeerManager(config, state_manager, authenticator)
+        watchdog = Watchdog(config, state_manager)
+        server = Server(config, state_manager, watchdog, authenticator, peer_manager)
+
+        async with TestClient(TestServer(server.app)) as test_client:
+            resp = await test_client.get("/dashboard")
+            text = await resp.text()
+            assert "unknown" in text
+            assert "peer1" in text
+
+
+class TestFormatDurationServer:
+    """Tests for _format_duration() in server module (Issue 1)."""
+
+    def test_sub_hour_shows_minutes(self):
+        assert _format_duration(timedelta(minutes=45)) == "45m"
+
+    def test_sub_minute_shows_seconds(self):
+        assert _format_duration(timedelta(seconds=30)) == "30s"
+
+
+class TestDashboardTimeDisplay:
+    """Tests for dashboard time display improvements (Issue 1)."""
+
+    @pytest.mark.asyncio
+    async def test_dashboard_sub_hour_checkin(self, client, state_manager):
+        """Sub-hour check-in should show minutes, not '0h'."""
+        state_manager.state.last_checkin = datetime.now(timezone.utc) - timedelta(minutes=30)
+        resp = await client.get("/dashboard")
+        text = await resp.text()
+        assert "30m" in text
+        assert "0h" not in text
+
+    @pytest.mark.asyncio
+    async def test_checkin_page_sub_hour(self, client, state_manager):
+        """Check-in page should show minutes for sub-hour times."""
+        state_manager.state.last_checkin = datetime.now(timezone.utc) - timedelta(seconds=45)
+        resp = await client.get("/checkin")
+        text = await resp.text()
+        assert "45s" in text
+
+
+class TestDashboardStatusRows:
+    """Tests for status-aware dashboard rows (Issue 3)."""
+
+    @pytest.mark.asyncio
+    async def test_warning_shows_active_row(self, client, state_manager):
+        """WARNING state should show 'Warning: Active' row."""
+        state_manager.state.status = Status.WARNING
+        state_manager.state.last_checkin = datetime.now(timezone.utc) - timedelta(days=9)
+        resp = await client.get("/dashboard")
+        text = await resp.text()
+        assert "Active" in text
+
+    @pytest.mark.asyncio
+    async def test_grace_shows_active_rows(self, client, state_manager):
+        """GRACE state should show active rows for warning and grace."""
+        state_manager.state.status = Status.GRACE
+        state_manager.state.last_checkin = datetime.now(timezone.utc) - timedelta(days=13)
+        resp = await client.get("/dashboard")
+        text = await resp.text()
+        assert "Active" in text
+
+    @pytest.mark.asyncio
+    async def test_triggered_shows_activated(self, client, state_manager):
+        """TRIGGERED state should show 'Activated' for trigger row."""
+        state_manager.state.status = Status.TRIGGERED
+        state_manager.state.trigger_time = datetime.now(timezone.utc)
+        state_manager.state.last_checkin = datetime.now(timezone.utc) - timedelta(days=20)
+        resp = await client.get("/dashboard")
+        text = await resp.text()
+        assert "Activated" in text
+
+
+class TestDashboardTriggeredCheckin:
+    """Tests for TRIGGERED since_checkin display (Issue 4)."""
+
+    @pytest.mark.asyncio
+    async def test_triggered_shows_last_checkin(self, client, state_manager):
+        """TRIGGERED state should show since_checkin, not 'Never'."""
+        state_manager.state.last_checkin = datetime.now(timezone.utc) - timedelta(days=20)
+        state_manager.state.status = Status.TRIGGERED
+        state_manager.state.trigger_time = datetime.now(timezone.utc) - timedelta(days=6)
+        resp = await client.get("/dashboard")
+        text = await resp.text()
+        assert "20d" in text
+        assert "Never" not in text.split("Since check-in")[1].split("</td>")[0]
+
+
+class TestDashboardOverdue:
+    """Tests for OVERDUE display logic (Issue 2)."""
+
+    @pytest.mark.asyncio
+    async def test_armed_not_overdue(self, client, state_manager):
+        """ARMED state should not show OVERDUE even with no checkin."""
+        resp = await client.get("/dashboard")
+        text = await resp.text()
+        assert "OVERDUE" not in text
+
+
+class TestFormHiding:
+    """Tests for form hiding in TRIGGERED and lockout states (Issues 5+6)."""
+
+    @pytest.mark.asyncio
+    async def test_triggered_hides_form(self, client, state_manager):
+        """TRIGGERED state should hide the check-in form."""
+        state_manager.state.status = Status.TRIGGERED
+        state_manager.state.trigger_time = datetime.now(timezone.utc)
+        resp = await client.get("/checkin")
+        text = await resp.text()
+        assert '<form' not in text
+        assert "no longer possible" in text.lower()
+
+    @pytest.mark.asyncio
+    async def test_lockout_hides_form(self, client, state_manager):
+        """Lockout should hide the check-in form."""
+        state_manager.state.lockout_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+        resp = await client.get("/checkin")
+        text = await resp.text()
+        assert '<form' not in text
+        assert "locked" in text.lower()
+
+    @pytest.mark.asyncio
+    async def test_armed_shows_form(self, client, state_manager):
+        """ARMED state should show the check-in form."""
+        resp = await client.get("/checkin")
+        text = await resp.text()
+        assert '<form' in text
+
+    @pytest.mark.asyncio
+    async def test_lockout_on_checkin_post(self, client, state_manager):
+        """Form POST with lockout should hide form in response."""
+        state_manager.state.lockout_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+        resp = await client.post("/checkin", data={"totp": "000000"})
+        text = await resp.text()
+        assert '<form' not in text
+        assert "locked" in text.lower()
+
+    @pytest.mark.asyncio
+    async def test_triggered_checkin_post_hides_form(self, client, state_manager):
+        """POST to triggered node should hide form in response."""
+        state_manager.state.status = Status.TRIGGERED
+        state_manager.state.trigger_time = datetime.now(timezone.utc)
+        code = generate_totp()
+        resp = await client.post("/checkin", data={"totp": code})
+        text = await resp.text()
+        assert '<form' not in text
+
+
+class TestFavicon:
+    """Tests for /favicon.ico endpoint (Issue 7)."""
+
+    @pytest.mark.asyncio
+    async def test_favicon_returns_svg(self, client):
+        resp = await client.get("/favicon.ico")
+        assert resp.status == 200
+        assert resp.content_type == "image/svg+xml"
+        text = await resp.text()
+        assert "<svg" in text
+
+    @pytest.mark.asyncio
+    async def test_favicon_cache_header(self, client):
+        resp = await client.get("/favicon.ico")
+        assert "max-age=86400" in resp.headers.get("Cache-Control", "")

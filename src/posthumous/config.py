@@ -112,9 +112,18 @@ class Config:
     max_failed_attempts: int = 5
     lockout_duration: timedelta = field(default_factory=lambda: timedelta(minutes=15))
 
+    # Watchdog check interval (None = auto-tune based on timing thresholds)
+    check_interval: timedelta | None = None
+
     # Peer health monitoring
     peer_check_interval: timedelta = field(default_factory=lambda: timedelta(minutes=30))
     peer_down_threshold: timedelta = field(default_factory=lambda: timedelta(hours=6))
+
+    # Base URL for constructing check-in/dashboard links in notifications
+    base_url: str | None = None
+
+    # Encryption at rest
+    encrypt_at_rest: bool = False
 
     # Paths (set after loading)
     config_dir: Path = field(default_factory=lambda: Path.home() / ".posthumous")
@@ -214,8 +223,11 @@ class Config:
             api_token=data.get('api_token'),
             max_failed_attempts=data.get('max_failed_attempts', 5),
             lockout_duration=get_duration('lockout_duration', timedelta(minutes=15)),
+            check_interval=parse_duration(data['check_interval']) if 'check_interval' in data else None,
             peer_check_interval=get_duration('peer_check_interval', timedelta(minutes=30)),
             peer_down_threshold=get_duration('peer_down_threshold', timedelta(hours=6)),
+            base_url=data.get('base_url'),
+            encrypt_at_rest=data.get('encrypt_at_rest', False),
             config_dir=config_dir,
         )
 
@@ -267,6 +279,9 @@ class Config:
             'trigger_at': format_duration(self.trigger_at),
         }
 
+        if self.base_url:
+            data['base_url'] = self.base_url
+
         if self.peers:
             data['peers'] = self.peers
 
@@ -288,6 +303,9 @@ class Config:
 
         if self.api_token:
             data['api_token'] = self.api_token
+
+        if self.encrypt_at_rest:
+            data['encrypt_at_rest'] = True
 
         return data
 
@@ -313,6 +331,24 @@ class Config:
                 pass
             raise
 
+    def get_base_url(self) -> str:
+        """Get the effective base URL for constructing check-in/dashboard links.
+
+        Returns base_url if explicitly set, otherwise auto-constructs from listen address.
+        """
+        if self.base_url:
+            return self.base_url.rstrip('/')
+        # Auto-construct from listen, replacing 0.0.0.0 with localhost
+        host = self.listen.replace('0.0.0.0', 'localhost')
+        return f"http://{host}"
+
+    def get_encryption_key(self) -> bytes | None:
+        """Get the encryption key for state files, or None if encryption is disabled."""
+        if not self.encrypt_at_rest:
+            return None
+        from posthumous.crypto import derive_key
+        return derive_key(self.secret_key)
+
     def get_script_path(self, script: str) -> Path:
         """Resolve a script path relative to config directory."""
         script_path = Path(script)
@@ -331,6 +367,11 @@ class Config:
             errors.append("grace_start should be greater than warning_start")
         if self.trigger_at <= self.grace_start:
             errors.append("trigger_at should be greater than grace_start")
+
+        # Check base_url format if set
+        if self.base_url is not None:
+            if not self.base_url.startswith(('http://', 'https://')):
+                errors.append("base_url must start with http:// or https://")
 
         # Check secret key is valid base32
         try:
@@ -374,19 +415,19 @@ def generate_default_config(node_name: str, secret_key: str) -> Config:
         on_warning=[
             NotificationAction(
                 channel='default',
-                message='Check-in needed. {days_left} days remaining before trigger.'
+                message='Check-in needed. {days_left} days remaining before trigger.\n\nCheck in: {checkin_url}'
             )
         ],
         on_grace=[
             NotificationAction(
                 channel='default',
-                message='URGENT: Posthumous triggers in {hours_left} hours.'
+                message='URGENT: Posthumous triggers in {hours_left} hours.\n\nCheck in: {checkin_url}'
             )
         ],
         on_trigger=[
             NotificationAction(
                 channel='default',
-                message='Posthumous has activated.'
+                message='Posthumous has activated.\n\nDashboard: {dashboard_url}'
             )
         ],
     )

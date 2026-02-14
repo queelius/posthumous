@@ -569,6 +569,25 @@ class TestScheduleStatusExtended:
         broken_status = next(s for s in status if s["name"] == "broken")
         assert broken_status["error"] == "Invalid when-expression"
 
+    def test_get_next_scheduled_unparsed_schedule_skipped(self, config, state_manager):
+        """Items with unparseable when-expressions are skipped in get_next_scheduled."""
+        config.post_trigger.append(ScheduledItem(
+            name="broken",
+            when="complete nonsense that cannot be parsed",
+        ))
+
+        scheduler = Scheduler(config, state_manager)
+
+        state_manager.state.status = Status.TRIGGERED
+        state_manager.state.trigger_time = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+
+        now = datetime(2026, 1, 16, 12, 0, 0, tzinfo=timezone.utc)
+        scheduled = scheduler.get_next_scheduled(now)
+
+        # "broken" should not appear in scheduled items
+        names = [item[0].name for item in scheduled]
+        assert "broken" not in names
+
     def test_status_with_next_occurrence(self, config, state_manager):
         """get_schedule_status when triggered should compute next_run."""
         scheduler = Scheduler(config, state_manager)
@@ -586,3 +605,57 @@ class TestScheduleStatusExtended:
 
         daily_status = next(s for s in status if s["name"] == "daily")
         assert daily_status["next_run"] is not None
+
+
+class TestSchedulerRunLoopEdgeCases:
+    """Edge-case tests for the scheduler run loop."""
+
+    @pytest.fixture
+    def config(self):
+        return Config(
+            node_name="test",
+            secret_key="JBSWY3DPEHPK3PXP",
+            post_trigger=[],
+        )
+
+    @pytest.fixture
+    def state_manager(self, tmp_path, config):
+        return StateManager(tmp_path / "state.yaml")
+
+    @pytest.mark.asyncio
+    async def test_run_loop_exception_handling(self, config, state_manager):
+        """Exception in scheduler loop body should be logged and re-raised."""
+        scheduler = Scheduler(config, state_manager)
+        scheduler._check_interval = 0.01
+        scheduler._running = True
+
+        state_manager.state.status = Status.TRIGGERED
+        state_manager.state.trigger_time = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+        # Make check_and_execute raise
+        async def failing_check():
+            raise RuntimeError("scheduler test error")
+
+        scheduler.check_and_execute = failing_check
+
+        with pytest.raises(RuntimeError, match="scheduler test error"):
+            await scheduler._run_loop()
+
+    @pytest.mark.asyncio
+    async def test_start_when_already_running(self, config, state_manager):
+        """start() when already running should be a no-op."""
+        import asyncio
+
+        scheduler = Scheduler(config, state_manager)
+        scheduler._running = True
+        scheduler._task = asyncio.ensure_future(asyncio.sleep(100))
+
+        # start() should return without creating a new task
+        scheduler.start()
+
+        # Clean up
+        scheduler._task.cancel()
+        try:
+            await scheduler._task
+        except asyncio.CancelledError:
+            pass

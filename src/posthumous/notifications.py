@@ -70,6 +70,9 @@ class NotificationManager:
         - {node_name}: Name of this node
         - {trigger_time}: When trigger occurred (ISO format)
         - {status}: Current status
+        - {base_url}: Base URL of the web UI
+        - {checkin_url}: Direct link to check-in page
+        - {dashboard_url}: Direct link to dashboard page
         """
         context = context or {}
 
@@ -202,6 +205,7 @@ def build_context(
     last_checkin: datetime | None = None,
     trigger_time: datetime | None = None,
     trigger_at: timedelta | None = None,
+    base_url: str | None = None,
 ) -> dict[str, Any]:
     """Build a context dictionary for message formatting.
 
@@ -211,6 +215,7 @@ def build_context(
         last_checkin: Last check-in timestamp
         trigger_time: When trigger occurred (if triggered)
         trigger_at: Duration from checkin to trigger
+        base_url: Base URL for constructing check-in/dashboard links
 
     Returns:
         Context dictionary with formatted values
@@ -237,6 +242,12 @@ def build_context(
             context["days_left"] = 0
             context["hours_left"] = 0
             context["minutes_left"] = 0
+
+    if base_url:
+        url = base_url.rstrip('/')
+        context["base_url"] = url
+        context["checkin_url"] = f"{url}/checkin"
+        context["dashboard_url"] = f"{url}/dashboard"
 
     return context
 
