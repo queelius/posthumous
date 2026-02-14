@@ -11,3 +11,4 @@ htmlcov/
 *.egg
 dev/
 .eggs/
+.playwright-mcp/
