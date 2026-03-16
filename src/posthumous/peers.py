@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
@@ -38,10 +39,12 @@ class PeerManager:
         config: "Config",
         state_manager: "StateManager",
         timeout: float = 10.0,
+        on_peer_down: Callable | None = None,
     ):
         self.config = config
         self.state_manager = state_manager
         self.timeout = timeout
+        self._on_peer_down = on_peer_down
         self._session: aiohttp.ClientSession | None = None
         self._health_task: asyncio.Task | None = None
         self._running = False
@@ -88,7 +91,12 @@ class PeerManager:
             logger.exception(f"Error posting to {url}: {e}")
             return False, str(e)
 
-    async def _get(self, peer_url: str, endpoint: str) -> tuple[dict | None, str | None]:
+    async def _get(
+        self,
+        peer_url: str,
+        endpoint: str,
+        params: dict[str, str] | None = None,
+    ) -> tuple[dict | None, str | None]:
         """GET from a peer endpoint.
 
         Returns (data, error_message).
@@ -97,7 +105,7 @@ class PeerManager:
 
         try:
             session = await self._get_session()
-            async with session.get(url) as response:
+            async with session.get(url, params=params) as response:
                 if response.status == 200:
                     data = await response.json()
                     return data, None
@@ -286,8 +294,12 @@ class PeerManager:
             logger.warning("No peers available for state sync")
             return False
 
-        # Get full state from best peer
-        data, error = await self._get(best_peer.url, "sync/state")
+        # Get full state from best peer (signed request)
+        ts = datetime.now(timezone.utc).isoformat()
+        sig = sign_message(self.config.secret_key, f"state:{ts}")
+        data, error = await self._get(
+            best_peer.url, "sync/state", params={"ts": ts, "sig": sig}
+        )
         if error:
             logger.error(f"Failed to get state from {best_peer.url}: {error}")
             return False
@@ -324,40 +336,53 @@ class PeerManager:
             logger.exception(f"Error applying synced state: {e}")
             return False
 
+    async def _health_check_once(self) -> None:
+        """Run a single health check iteration.
+
+        Checks all peers, updates state, and fires the on_peer_down callback
+        when a peer exceeds the configured down threshold (once per episode).
+        """
+        statuses = await self.get_all_peer_status()
+        down_threshold = self.config.peer_down_threshold
+
+        now = datetime.now(timezone.utc)
+        for status in statuses:
+            peer_state = self.state_manager.state.peer_states.get(status.url)
+
+            if status.reachable:
+                self.state_manager.state.update_peer(
+                    status.url, success=True
+                )
+                self._alerted_peers.discard(status.url)
+            else:
+                self.state_manager.state.update_peer(
+                    status.url, success=False, error=status.error
+                )
+
+                # Check if we should alert (once per down episode)
+                if peer_state and peer_state.last_seen:
+                    down_duration = now - peer_state.last_seen
+                    if down_duration >= down_threshold and status.url not in self._alerted_peers:
+                        logger.warning(
+                            f"Peer {status.url} has been unreachable for {down_duration}"
+                        )
+                        self._alerted_peers.add(status.url)
+                        if self._on_peer_down:
+                            await self._on_peer_down(
+                                status.url,
+                                down_duration,
+                                peer_state.last_seen,
+                            )
+
+        self.state_manager.save()
+
     async def _health_check_loop(self) -> None:
         """Periodically check peer health."""
         check_interval = self.config.peer_check_interval.total_seconds()
-        down_threshold = self.config.peer_down_threshold
 
         while self._running:
             try:
-                statuses = await self.get_all_peer_status()
-
-                now = datetime.now(timezone.utc)
-                for status in statuses:
-                    peer_state = self.state_manager.state.peer_states.get(status.url)
-
-                    if status.reachable:
-                        self.state_manager.state.update_peer(
-                            status.url, success=True
-                        )
-                        self._alerted_peers.discard(status.url)
-                    else:
-                        self.state_manager.state.update_peer(
-                            status.url, success=False, error=status.error
-                        )
-
-                        # Check if we should alert (once per down episode)
-                        if peer_state and peer_state.last_seen:
-                            down_duration = now - peer_state.last_seen
-                            if down_duration >= down_threshold and status.url not in self._alerted_peers:
-                                logger.warning(
-                                    f"Peer {status.url} has been unreachable for {down_duration}"
-                                )
-                                self._alerted_peers.add(status.url)
-                                # TODO: Send notification about peer being down
-
-                self.state_manager.save()
+                await self._health_check_once()
                 await asyncio.sleep(check_interval)
             except asyncio.CancelledError:
                 logger.debug("Health check loop cancelled")

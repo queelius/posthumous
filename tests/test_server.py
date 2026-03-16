@@ -606,12 +606,39 @@ class TestSyncScheduled:
         assert data["error"] == "Invalid JSON"
 
 
+class TestSyncStateAuth:
+    """Tests for HMAC authentication on GET /sync/state."""
+
+    @pytest.mark.asyncio
+    async def test_sync_state_rejects_unsigned_request(self, client):
+        resp = await client.get("/sync/state")
+        assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_sync_state_rejects_stale_timestamp(self, client):
+        old_time = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        signature = sign_message(SECRET, f"state:{old_time}")
+        resp = await client.get("/sync/state", params={"ts": old_time, "sig": signature})
+        assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_sync_state_accepts_valid_auth(self, client):
+        now = datetime.now(timezone.utc).isoformat()
+        signature = sign_message(SECRET, f"state:{now}")
+        resp = await client.get("/sync/state", params={"ts": now, "sig": signature})
+        assert resp.status == 200
+        data = await resp.json()
+        assert "status" in data
+
+
 class TestSyncState:
     """Tests for GET /sync/state."""
 
     @pytest.mark.asyncio
     async def test_sync_state_returns_json(self, client):
-        resp = await client.get("/sync/state")
+        now = datetime.now(timezone.utc).isoformat()
+        signature = sign_message(SECRET, f"state:{now}")
+        resp = await client.get("/sync/state", params={"ts": now, "sig": signature})
 
         assert resp.status == 200
         data = await resp.json()
@@ -626,7 +653,9 @@ class TestSyncState:
         state_manager.state.mark_schedule_item_run("weekly-email", "2026-W05")
         state_manager.state.mark_schedule_item_run("annual-backup", "2026")
 
-        resp = await client.get("/sync/state")
+        now = datetime.now(timezone.utc).isoformat()
+        signature = sign_message(SECRET, f"state:{now}")
+        resp = await client.get("/sync/state", params={"ts": now, "sig": signature})
 
         data = await resp.json()
         assert "weekly-email" in data["schedule_state"]
@@ -642,7 +671,9 @@ class TestSyncState:
         state_manager.state.status = Status.TRIGGERED
         state_manager.state.trigger_time = trigger_time
 
-        resp = await client.get("/sync/state")
+        now = datetime.now(timezone.utc).isoformat()
+        signature = sign_message(SECRET, f"state:{now}")
+        resp = await client.get("/sync/state", params={"ts": now, "sig": signature})
 
         data = await resp.json()
         assert data["status"] == "triggered"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import yaml
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1022,3 +1023,506 @@ class TestReset:
 
         assert result.exit_code == 1
         assert "Config not found" in result.output
+
+
+class TestServiceInstall:
+    """Tests for 'service install' command."""
+
+    @pytest.fixture
+    def runner(self):
+        return CliRunner()
+
+    @pytest.fixture
+    def valid_config_dir(self, tmp_path):
+        config_dir = tmp_path / ".posthumous"
+        config_dir.mkdir()
+        (config_dir / "scripts").mkdir()
+        (config_dir / "logs").mkdir()
+        config_path = config_dir / "config.yaml"
+        config_path.write_text(
+            "node_name: test-node\n"
+            f"secret_key: {SECRET}\n"
+            "listen: '127.0.0.1:8420'\n"
+            "checkin_interval: 7 days\n"
+            "warning_start: 8 days\n"
+            "grace_start: 12 days\n"
+            "trigger_at: 14 days\n"
+        )
+        return config_dir
+
+    @pytest.fixture
+    def config_path(self, valid_config_dir):
+        return valid_config_dir / "config.yaml"
+
+    def test_install_writes_unit_file(self, runner, config_path, tmp_path):
+        """install should write a unit file with correct content."""
+        unit_path = tmp_path / "posthumous.service"
+
+        with patch('posthumous.systemd.get_unit_path', return_value=unit_path), \
+             patch('posthumous.cli.subprocess.run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            result = runner.invoke(
+                main, ['-c', str(config_path), 'service', 'install'],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert unit_path.exists()
+        content = unit_path.read_text()
+        assert "test-node" in content
+        assert "ExecStart=" in content
+        assert "Type=notify" in content
+        assert "WatchdogSec=30" in content
+        assert "Unit file written to" in result.output
+        assert "installed, enabled, and started" in result.output
+
+    def test_install_calls_systemctl(self, runner, config_path, tmp_path):
+        """install should call systemctl daemon-reload, enable, start."""
+        unit_path = tmp_path / "posthumous.service"
+        calls = []
+
+        def track_run(cmd, **kwargs):
+            calls.append(cmd)
+            return MagicMock(returncode=0)
+
+        with patch('posthumous.systemd.get_unit_path', return_value=unit_path), \
+             patch('posthumous.cli.subprocess.run', side_effect=track_run):
+            result = runner.invoke(
+                main, ['-c', str(config_path), 'service', 'install'],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert ["systemctl", "--user", "daemon-reload"] in calls
+        assert ["systemctl", "--user", "enable", "posthumous"] in calls
+        assert ["systemctl", "--user", "start", "posthumous"] in calls
+
+    def test_install_no_config(self, runner, tmp_path):
+        """install with missing config should exit 1."""
+        config_path = tmp_path / "missing.yaml"
+
+        result = runner.invoke(
+            main, ['-c', str(config_path), 'service', 'install'],
+        )
+
+        assert result.exit_code == 1
+        assert "Config not found" in result.output
+
+
+class TestServiceUninstall:
+    """Tests for 'service uninstall' command."""
+
+    @pytest.fixture
+    def runner(self):
+        return CliRunner()
+
+    def test_uninstall_removes_unit_file(self, runner, tmp_path):
+        """uninstall should remove the unit file."""
+        unit_path = tmp_path / "posthumous.service"
+        unit_path.write_text("[Unit]\nDescription=test\n")
+
+        calls = []
+
+        def track_run(cmd, **kwargs):
+            calls.append(cmd)
+            return MagicMock(returncode=0)
+
+        with patch('posthumous.systemd.get_unit_path', return_value=unit_path), \
+             patch('posthumous.cli.subprocess.run', side_effect=track_run):
+            result = runner.invoke(main, ['service', 'uninstall'])
+
+        assert result.exit_code == 0, result.output
+        assert not unit_path.exists()
+        assert "stopped, disabled, and removed" in result.output
+
+    def test_uninstall_calls_systemctl(self, runner, tmp_path):
+        """uninstall should call systemctl stop, disable, daemon-reload."""
+        unit_path = tmp_path / "posthumous.service"
+        unit_path.write_text("[Unit]\nDescription=test\n")
+
+        calls = []
+
+        def track_run(cmd, **kwargs):
+            calls.append(cmd)
+            return MagicMock(returncode=0)
+
+        with patch('posthumous.systemd.get_unit_path', return_value=unit_path), \
+             patch('posthumous.cli.subprocess.run', side_effect=track_run):
+            result = runner.invoke(main, ['service', 'uninstall'])
+
+        assert result.exit_code == 0, result.output
+        assert ["systemctl", "--user", "stop", "posthumous"] in calls
+        assert ["systemctl", "--user", "disable", "posthumous"] in calls
+        assert ["systemctl", "--user", "daemon-reload"] in calls
+
+    def test_uninstall_not_installed(self, runner, tmp_path):
+        """uninstall when not installed should exit 1."""
+        unit_path = tmp_path / "posthumous.service"
+        # unit_path does not exist
+
+        with patch('posthumous.systemd.get_unit_path', return_value=unit_path):
+            result = runner.invoke(main, ['service', 'uninstall'])
+
+        assert result.exit_code == 1
+        assert "not installed" in result.output
+
+
+class TestServiceStatus:
+    """Tests for 'service status' command."""
+
+    @pytest.fixture
+    def runner(self):
+        return CliRunner()
+
+    def test_status_calls_systemctl(self, runner):
+        """status should call systemctl --user status posthumous."""
+        with patch('posthumous.cli.subprocess.run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            result = runner.invoke(main, ['service', 'status'])
+
+        mock_run.assert_called_once_with(
+            ["systemctl", "--user", "status", "posthumous"]
+        )
+
+
+class TestServiceLogs:
+    """Tests for 'service logs' command."""
+
+    @pytest.fixture
+    def runner(self):
+        return CliRunner()
+
+    def test_logs_calls_journalctl(self, runner):
+        """logs should call journalctl --user -u posthumous --no-pager."""
+        with patch('posthumous.cli.subprocess.run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            result = runner.invoke(main, ['service', 'logs'])
+
+        mock_run.assert_called_once_with(
+            ["journalctl", "--user", "-u", "posthumous", "--no-pager"]
+        )
+
+    def test_logs_follow(self, runner):
+        """logs --follow should append -f flag."""
+        with patch('posthumous.cli.subprocess.run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            result = runner.invoke(main, ['service', 'logs', '--follow'])
+
+        mock_run.assert_called_once_with(
+            ["journalctl", "--user", "-u", "posthumous", "--no-pager", "-f"]
+        )
+
+
+class TestAutoRecovery:
+    """Tests for automatic state recovery from peers on corrupt state (Task 7)."""
+
+    @pytest.fixture
+    def runner(self):
+        return CliRunner()
+
+    @pytest.fixture
+    def config_dir_with_corrupt_state(self, tmp_path):
+        """Create a config directory with a valid config and corrupt state file."""
+        config_dir = tmp_path / ".posthumous"
+        config_dir.mkdir()
+        (config_dir / "scripts").mkdir()
+        (config_dir / "logs").mkdir()
+
+        config_path = config_dir / "config.yaml"
+        config_path.write_text(
+            "node_name: test-node\n"
+            f"secret_key: {SECRET}\n"
+            "listen: '127.0.0.1:8420'\n"
+            "checkin_interval: 7 days\n"
+            "warning_start: 8 days\n"
+            "grace_start: 12 days\n"
+            "trigger_at: 14 days\n"
+            "peers:\n"
+            "  - http://peer1:8420\n"
+        )
+
+        # Write corrupt state YAML
+        state_path = config_dir / "state.yaml"
+        state_path.write_text("{{{{not valid yaml: [[[")
+
+        return config_dir
+
+    def test_corrupt_state_triggers_peer_recovery(self, runner, config_dir_with_corrupt_state):
+        """When state file is corrupt, the run command should attempt peer recovery
+        before constructing the main StateManager."""
+        config_path = config_dir_with_corrupt_state / "config.yaml"
+
+        # Track what coroutines are passed to asyncio.run
+        recovery_ran = False
+
+        with patch('posthumous.peers.PeerManager.sync_state_from_peers',
+                   new_callable=AsyncMock, return_value=True) as mock_sync, \
+             patch('posthumous.peers.PeerManager.close',
+                   new_callable=AsyncMock) as mock_close, \
+             patch('posthumous.cli.asyncio.run') as mock_asyncio_run:
+
+            def run_side_effect(coro):
+                nonlocal recovery_ran
+                # Run coroutines with a fresh event loop so mocks are exercised
+                loop = asyncio.new_event_loop()
+                try:
+                    result = loop.run_until_complete(coro)
+                    recovery_ran = True
+                    return result
+                except KeyboardInterrupt:
+                    pass
+                finally:
+                    loop.close()
+
+            mock_asyncio_run.side_effect = run_side_effect
+
+            result = runner.invoke(
+                main, ['-c', str(config_path), 'run'],
+            )
+
+            assert recovery_ran
+            mock_sync.assert_called_once()
+
+    def test_corrupt_state_recovery_failure_continues(self, runner, config_dir_with_corrupt_state):
+        """When peer recovery fails, the run command should continue with fresh state."""
+        config_path = config_dir_with_corrupt_state / "config.yaml"
+
+        with patch('posthumous.peers.PeerManager.sync_state_from_peers',
+                   new_callable=AsyncMock, return_value=False) as mock_sync, \
+             patch('posthumous.peers.PeerManager.close',
+                   new_callable=AsyncMock) as mock_close, \
+             patch('posthumous.cli.asyncio.run') as mock_asyncio_run:
+
+            def run_side_effect(coro):
+                loop = asyncio.new_event_loop()
+                try:
+                    return loop.run_until_complete(coro)
+                except KeyboardInterrupt:
+                    pass
+                finally:
+                    loop.close()
+
+            mock_asyncio_run.side_effect = run_side_effect
+
+            result = runner.invoke(
+                main, ['-c', str(config_path), 'run'],
+            )
+
+            # Recovery was attempted but failed - should still proceed
+            mock_sync.assert_called_once()
+
+    def test_corrupt_state_recovery_exception_continues(self, runner, config_dir_with_corrupt_state):
+        """When peer recovery raises an exception, the run command should continue."""
+        config_path = config_dir_with_corrupt_state / "config.yaml"
+
+        with patch('posthumous.peers.PeerManager.sync_state_from_peers',
+                   new_callable=AsyncMock,
+                   side_effect=Exception("Network error")) as mock_sync, \
+             patch('posthumous.peers.PeerManager.close',
+                   new_callable=AsyncMock) as mock_close, \
+             patch('posthumous.cli.asyncio.run') as mock_asyncio_run:
+
+            def run_side_effect(coro):
+                loop = asyncio.new_event_loop()
+                try:
+                    return loop.run_until_complete(coro)
+                except KeyboardInterrupt:
+                    pass
+                finally:
+                    loop.close()
+
+            mock_asyncio_run.side_effect = run_side_effect
+
+            result = runner.invoke(
+                main, ['-c', str(config_path), 'run'],
+            )
+
+            # Recovery was attempted, exception was caught
+            mock_sync.assert_called_once()
+
+    def test_valid_state_skips_recovery(self, runner, tmp_path):
+        """When state file is valid, no recovery should be attempted."""
+        config_dir = tmp_path / ".posthumous"
+        config_dir.mkdir()
+        (config_dir / "scripts").mkdir()
+        (config_dir / "logs").mkdir()
+
+        config_path = config_dir / "config.yaml"
+        config_path.write_text(
+            "node_name: test-node\n"
+            f"secret_key: {SECRET}\n"
+            "listen: '127.0.0.1:8420'\n"
+            "checkin_interval: 7 days\n"
+            "warning_start: 8 days\n"
+            "grace_start: 12 days\n"
+            "trigger_at: 14 days\n"
+            "peers:\n"
+            "  - http://peer1:8420\n"
+        )
+
+        # Write valid state
+        from posthumous.state import State
+        state = State()
+        state.save(config_dir / "state.yaml")
+
+        with patch('posthumous.peers.PeerManager.sync_state_from_peers',
+                   new_callable=AsyncMock) as mock_sync, \
+             patch('posthumous.cli.asyncio.run') as mock_asyncio_run:
+
+            def run_side_effect(coro):
+                loop = asyncio.new_event_loop()
+                try:
+                    return loop.run_until_complete(coro)
+                except KeyboardInterrupt:
+                    pass
+                finally:
+                    loop.close()
+
+            mock_asyncio_run.side_effect = run_side_effect
+
+            result = runner.invoke(
+                main, ['-c', str(config_path), 'run'],
+            )
+
+            # sync_state_from_peers should NOT have been called
+            mock_sync.assert_not_called()
+
+
+class TestRecover:
+    """Tests for the 'recover' command (Task 8)."""
+
+    @pytest.fixture
+    def runner(self):
+        return CliRunner()
+
+    @pytest.fixture
+    def valid_config_dir(self, tmp_path):
+        config_dir = tmp_path / ".posthumous"
+        config_dir.mkdir()
+        (config_dir / "scripts").mkdir()
+        (config_dir / "logs").mkdir()
+        config_path = config_dir / "config.yaml"
+        config_path.write_text(
+            "node_name: test-node\n"
+            f"secret_key: {SECRET}\n"
+            "listen: '127.0.0.1:8420'\n"
+            "checkin_interval: 7 days\n"
+            "warning_start: 8 days\n"
+            "grace_start: 12 days\n"
+            "trigger_at: 14 days\n"
+            "peers:\n"
+            "  - http://peer1:8420\n"
+        )
+        return config_dir
+
+    @pytest.fixture
+    def config_path(self, valid_config_dir):
+        return valid_config_dir / "config.yaml"
+
+    def test_recover_with_force(self, runner, config_path):
+        """recover --force should sync from peers and report success."""
+        with patch('posthumous.peers.PeerManager.sync_state_from_peers',
+                   new_callable=AsyncMock, return_value=True) as mock_sync, \
+             patch('posthumous.peers.PeerManager.close',
+                   new_callable=AsyncMock):
+
+            result = runner.invoke(
+                main, ['-c', str(config_path), 'recover', '--force'],
+            )
+
+            assert result.exit_code == 0
+            assert "recovered" in result.output.lower() or "success" in result.output.lower()
+            mock_sync.assert_called_once()
+
+    def test_recover_without_force_prompts(self, runner, config_path):
+        """recover without --force should show state comparison and prompt."""
+        peer_status = MagicMock()
+        peer_status.reachable = True
+        peer_status.last_checkin = datetime(2026, 3, 10, 12, 0, 0, tzinfo=timezone.utc)
+        peer_status.url = "http://peer1:8420"
+        peer_status.status = "armed"
+
+        with patch('posthumous.peers.PeerManager.get_all_peer_status',
+                   new_callable=AsyncMock, return_value=[peer_status]) as mock_status, \
+             patch('posthumous.peers.PeerManager.sync_state_from_peers',
+                   new_callable=AsyncMock, return_value=True), \
+             patch('posthumous.peers.PeerManager.close',
+                   new_callable=AsyncMock):
+
+            # User answers "n" to abort
+            result = runner.invoke(
+                main, ['-c', str(config_path), 'recover'],
+                input="n\n",
+            )
+
+            assert result.exit_code == 0
+            assert "Aborted" in result.output
+            # Should have shown local state info
+            assert "Local state" in result.output
+            assert "Peer state" in result.output
+
+    def test_recover_without_force_confirms(self, runner, config_path):
+        """recover without --force, answering y, should proceed with sync."""
+        peer_status = MagicMock()
+        peer_status.reachable = True
+        peer_status.last_checkin = datetime(2026, 3, 10, 12, 0, 0, tzinfo=timezone.utc)
+        peer_status.url = "http://peer1:8420"
+        peer_status.status = "armed"
+
+        with patch('posthumous.peers.PeerManager.get_all_peer_status',
+                   new_callable=AsyncMock, return_value=[peer_status]) as mock_status, \
+             patch('posthumous.peers.PeerManager.sync_state_from_peers',
+                   new_callable=AsyncMock, return_value=True) as mock_sync, \
+             patch('posthumous.peers.PeerManager.close',
+                   new_callable=AsyncMock):
+
+            result = runner.invoke(
+                main, ['-c', str(config_path), 'recover'],
+                input="y\n",
+            )
+
+            assert result.exit_code == 0
+            assert "recovered" in result.output.lower() or "success" in result.output.lower()
+            mock_sync.assert_called_once()
+
+    def test_recover_no_peers(self, runner, config_path):
+        """When no peers are available for recovery, should exit with error."""
+        with patch('posthumous.peers.PeerManager.sync_state_from_peers',
+                   new_callable=AsyncMock, return_value=False) as mock_sync, \
+             patch('posthumous.peers.PeerManager.close',
+                   new_callable=AsyncMock):
+
+            result = runner.invoke(
+                main, ['-c', str(config_path), 'recover', '--force'],
+            )
+
+            assert result.exit_code == 1
+            assert "No peers available" in result.output
+
+    def test_recover_no_config(self, runner, tmp_path):
+        """recover with missing config should exit with error."""
+        config_path = tmp_path / "missing.yaml"
+
+        result = runner.invoke(
+            main, ['-c', str(config_path), 'recover'],
+        )
+
+        assert result.exit_code == 1
+        assert "Config not found" in result.output
+
+    def test_recover_no_reachable_peers_interactive(self, runner, config_path):
+        """When no peers are reachable in interactive mode, should show message and return."""
+        peer_status = MagicMock()
+        peer_status.reachable = False
+        peer_status.last_checkin = None
+        peer_status.url = "http://peer1:8420"
+
+        with patch('posthumous.peers.PeerManager.get_all_peer_status',
+                   new_callable=AsyncMock, return_value=[peer_status]) as mock_status, \
+             patch('posthumous.peers.PeerManager.close',
+                   new_callable=AsyncMock):
+
+            result = runner.invoke(
+                main, ['-c', str(config_path), 'recover'],
+            )
+
+            assert result.exit_code == 0
+            assert "No reachable peers" in result.output

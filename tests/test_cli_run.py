@@ -266,23 +266,27 @@ class TestRunComponents:
         mock_notif_mgr.send.assert_called()
         mock_script_runner.run.assert_called()
 
-    def test_run_daemon_flag(self, runner, config_path):
-        """--daemon flag should print 'not yet implemented' message."""
-        mock_server = _make_mock_server()
-        mock_watchdog = _make_mock_watchdog()
-        mock_scheduler = _make_mock_scheduler()
-        mock_peer_mgr = _make_mock_peer_manager()
-
-        with patch('posthumous.server.Server', return_value=mock_server), \
-             patch('posthumous.watchdog.Watchdog', return_value=mock_watchdog), \
-             patch('posthumous.scheduler.Scheduler', return_value=mock_scheduler), \
-             patch('posthumous.peers.PeerManager', return_value=mock_peer_mgr), \
-             patch('asyncio.Event.wait', new_callable=AsyncMock):
+    def test_run_daemon_flag_with_systemd(self, runner, config_path):
+        """--daemon should suggest systemd when service is installed."""
+        with patch('posthumous.systemd.is_service_installed', return_value=True):
             result = runner.invoke(
                 main, ['-c', str(config_path), 'run', '--daemon'],
             )
 
-        assert "Daemon mode not yet implemented" in result.output
+        assert "Systemd service is installed" in result.output
+        assert result.exit_code == 0
+
+    def test_run_daemon_flag_double_fork(self, runner, config_path):
+        """--daemon should call os.fork when systemd is not installed."""
+        with patch('posthumous.systemd.is_service_installed', return_value=False), \
+             patch('os.fork', return_value=1) as mock_fork:
+            # First fork returns >0, so parent exits
+            result = runner.invoke(
+                main, ['-c', str(config_path), 'run', '--daemon'],
+            )
+
+        mock_fork.assert_called_once()
+        # Parent process exits with sys.exit(0)
 
     def test_run_keyboard_interrupt(self, runner, config_path):
         """KeyboardInterrupt during asyncio.run should be caught gracefully."""
@@ -421,3 +425,160 @@ class TestRunComponents:
         mock_peer_mgr.broadcast_scheduled_complete.assert_called_once_with(
             "daily", "2026-01-16"
         )
+
+
+class TestSdNotifyIntegration:
+    """Tests for sd_notify integration in run_daemon."""
+
+    def test_notify_ready_called_on_start(self, runner, config_path):
+        """notify_ready should be called after all components start."""
+        mock_server = _make_mock_server()
+        mock_watchdog = _make_mock_watchdog()
+        mock_scheduler = _make_mock_scheduler()
+        mock_peer_mgr = _make_mock_peer_manager()
+
+        with patch('posthumous.server.Server', return_value=mock_server), \
+             patch('posthumous.watchdog.Watchdog', return_value=mock_watchdog), \
+             patch('posthumous.scheduler.Scheduler', return_value=mock_scheduler), \
+             patch('posthumous.peers.PeerManager', return_value=mock_peer_mgr), \
+             patch('posthumous.systemd.notify_ready') as mock_ready, \
+             patch('posthumous.systemd.notify_watchdog') as mock_wd, \
+             patch('posthumous.systemd.notify_stopping') as mock_stopping, \
+             patch('asyncio.Event.wait', new_callable=AsyncMock):
+            result = runner.invoke(
+                main, ['-c', str(config_path), 'run'],
+            )
+
+        mock_ready.assert_called_once()
+
+    def test_notify_stopping_called_on_shutdown(self, runner, config_path):
+        """notify_stopping should be called during shutdown."""
+        mock_server = _make_mock_server()
+        mock_watchdog = _make_mock_watchdog()
+        mock_scheduler = _make_mock_scheduler()
+        mock_peer_mgr = _make_mock_peer_manager()
+
+        with patch('posthumous.server.Server', return_value=mock_server), \
+             patch('posthumous.watchdog.Watchdog', return_value=mock_watchdog), \
+             patch('posthumous.scheduler.Scheduler', return_value=mock_scheduler), \
+             patch('posthumous.peers.PeerManager', return_value=mock_peer_mgr), \
+             patch('posthumous.systemd.notify_ready') as mock_ready, \
+             patch('posthumous.systemd.notify_watchdog') as mock_wd, \
+             patch('posthumous.systemd.notify_stopping') as mock_stopping, \
+             patch('asyncio.Event.wait', new_callable=AsyncMock):
+            result = runner.invoke(
+                main, ['-c', str(config_path), 'run'],
+            )
+
+        mock_stopping.assert_called_once()
+
+    def test_watchdog_ping_runs_before_shutdown(self, runner, config_path):
+        """notify_watchdog should be called at least once during the loop."""
+        mock_server = _make_mock_server()
+        mock_watchdog = _make_mock_watchdog()
+        mock_scheduler = _make_mock_scheduler()
+        mock_peer_mgr = _make_mock_peer_manager()
+
+        async def slow_wait(*args, **kwargs):
+            """Let the watchdog_ping task run at least one iteration."""
+            # The watchdog_ping loop sleeps 15s between pings, but we mock
+            # asyncio.sleep below so it resolves instantly. We just need to
+            # yield control so the task gets a chance to run.
+            await asyncio.sleep(0.05)
+
+        original_sleep = asyncio.sleep
+
+        async def fast_sleep(seconds):
+            """Replace 15s sleeps with instant yields, keep short sleeps real."""
+            if seconds >= 1:
+                await original_sleep(0)
+            else:
+                await original_sleep(seconds)
+
+        with patch('posthumous.server.Server', return_value=mock_server), \
+             patch('posthumous.watchdog.Watchdog', return_value=mock_watchdog), \
+             patch('posthumous.scheduler.Scheduler', return_value=mock_scheduler), \
+             patch('posthumous.peers.PeerManager', return_value=mock_peer_mgr), \
+             patch('posthumous.systemd.notify_ready'), \
+             patch('posthumous.systemd.notify_watchdog') as mock_wd, \
+             patch('posthumous.systemd.notify_stopping'), \
+             patch('asyncio.Event.wait', new_callable=lambda: AsyncMock(side_effect=slow_wait)), \
+             patch('asyncio.sleep', side_effect=fast_sleep):
+            result = runner.invoke(
+                main, ['-c', str(config_path), 'run'],
+            )
+
+        # The watchdog_ping task should have called notify_watchdog at least once
+        assert mock_wd.call_count >= 1
+
+
+class TestPeerDownWiring:
+    """Test that on_peer_down callback is wired to PeerManager in the run command."""
+
+    def test_peer_manager_receives_callback(self, runner, config_path):
+        """PeerManager should be constructed with an on_peer_down callback."""
+        mock_server = _make_mock_server()
+        mock_watchdog = _make_mock_watchdog()
+        mock_scheduler = _make_mock_scheduler()
+        mock_peer_mgr = _make_mock_peer_manager()
+
+        captured_kwargs = {}
+
+        def capture_peer_manager(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            return mock_peer_mgr
+
+        with patch('posthumous.server.Server', return_value=mock_server), \
+             patch('posthumous.watchdog.Watchdog', return_value=mock_watchdog), \
+             patch('posthumous.scheduler.Scheduler', return_value=mock_scheduler), \
+             patch('posthumous.peers.PeerManager', side_effect=capture_peer_manager), \
+             patch('asyncio.Event.wait', new_callable=AsyncMock):
+            result = runner.invoke(
+                main, ['-c', str(config_path), 'run'],
+            )
+
+        assert 'on_peer_down' in captured_kwargs
+        assert callable(captured_kwargs['on_peer_down'])
+
+
+class TestDaemonStop:
+    """Tests for the --stop flag."""
+
+    def test_stop_reads_pid_and_sends_sigterm(self, runner, config_path):
+        """--stop should read PID file and send SIGTERM."""
+        pid_path = config_path.parent / "posthumous.pid"
+        pid_path.write_text("12345")
+
+        with patch('os.kill') as mock_kill:
+            # First call is SIGTERM, second call (os.kill(pid, 0)) raises ProcessLookupError
+            mock_kill.side_effect = [None, ProcessLookupError]
+            result = runner.invoke(
+                main, ['-c', str(config_path), 'run', '--stop'],
+            )
+
+        assert "Sent SIGTERM to PID 12345" in result.output
+        assert "Daemon stopped" in result.output
+        mock_kill.assert_any_call(12345, 15)  # signal.SIGTERM = 15
+
+    def test_stop_no_pid_file(self, runner, config_path):
+        """--stop with no PID file should show error."""
+        result = runner.invoke(
+            main, ['-c', str(config_path), 'run', '--stop'],
+        )
+
+        assert "No PID file found" in result.output
+        assert result.exit_code == 1
+
+    def test_stop_process_wont_die(self, runner, config_path):
+        """--stop should warn if process doesn't terminate."""
+        pid_path = config_path.parent / "posthumous.pid"
+        pid_path.write_text("99999")
+
+        with patch('os.kill', return_value=None), \
+             patch('time.sleep'):
+            result = runner.invoke(
+                main, ['-c', str(config_path), 'run', '--stop'],
+            )
+
+        assert "still running" in result.output
+        assert result.exit_code == 1

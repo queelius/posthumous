@@ -671,3 +671,103 @@ class TestConfigFilePermissions:
         config.save(path)
         mode = stat.S_IMODE(path.stat().st_mode)
         assert mode == 0o600
+
+
+class TestOnPeerDown:
+    """Tests for on_peer_down config field."""
+
+    def test_default_is_empty_list(self):
+        config = Config(
+            node_name="test",
+            secret_key="JBSWY3DPEHPK3PXP",
+        )
+        assert config.on_peer_down == []
+
+    def test_from_dict_parses_on_peer_down(self):
+        data = {
+            "node_name": "test",
+            "secret_key": "JBSWY3DPEHPK3PXP",
+            "notifications": {"default": ["ntfy://test"]},
+            "actions": {
+                "on_peer_down": [
+                    {"notify": "default", "message": "Peer {peer_url} is down!"},
+                    {"script": "scripts/peer_down.sh"},
+                ],
+            },
+        }
+        config = Config.from_dict(data)
+
+        assert len(config.on_peer_down) == 2
+        assert isinstance(config.on_peer_down[0], NotificationAction)
+        assert config.on_peer_down[0].channel == "default"
+        assert "{peer_url}" in config.on_peer_down[0].message
+        assert isinstance(config.on_peer_down[1], ScriptAction)
+        assert config.on_peer_down[1].script == "scripts/peer_down.sh"
+
+    def test_from_dict_without_on_peer_down(self):
+        data = {
+            "node_name": "test",
+            "secret_key": "JBSWY3DPEHPK3PXP",
+            "actions": {
+                "on_warning": [{"notify": "default", "message": "Warning!"}],
+            },
+            "notifications": {"default": ["ntfy://test"]},
+        }
+        config = Config.from_dict(data)
+        assert config.on_peer_down == []
+
+    def test_to_dict_includes_on_peer_down(self):
+        config = Config(
+            node_name="test",
+            secret_key="JBSWY3DPEHPK3PXP",
+            on_peer_down=[
+                NotificationAction(channel="default", message="Peer down!"),
+                ScriptAction(script="scripts/alert.sh"),
+            ],
+        )
+        data = config.to_dict()
+
+        assert "actions" in data
+        assert "on_peer_down" in data["actions"]
+        assert len(data["actions"]["on_peer_down"]) == 2
+        assert data["actions"]["on_peer_down"][0]["notify"] == "default"
+        assert data["actions"]["on_peer_down"][1]["script"] == "scripts/alert.sh"
+
+    def test_to_dict_omits_empty_on_peer_down(self):
+        config = Config(
+            node_name="test",
+            secret_key="JBSWY3DPEHPK3PXP",
+        )
+        data = config.to_dict()
+        assert "actions" not in data or "on_peer_down" not in data.get("actions", {})
+
+    def test_round_trip_with_on_peer_down(self, tmp_path):
+        config = Config(
+            node_name="test",
+            secret_key="JBSWY3DPEHPK3PXP",
+            notifications={"default": ["ntfy://test"]},
+            on_peer_down=[
+                NotificationAction(channel="default", message="Peer {peer_url} down for {peer_downtime}"),
+            ],
+            config_dir=tmp_path,
+        )
+        config_path = tmp_path / "config.yaml"
+        config.save(config_path)
+
+        loaded = Config.from_yaml(config_path)
+        assert len(loaded.on_peer_down) == 1
+        assert isinstance(loaded.on_peer_down[0], NotificationAction)
+        assert loaded.on_peer_down[0].channel == "default"
+        assert "{peer_url}" in loaded.on_peer_down[0].message
+
+    def test_validate_checks_on_peer_down_channels(self):
+        config = Config(
+            node_name="test",
+            secret_key="JBSWY3DPEHPK3PXP",
+            notifications={"default": ["ntfy://test"]},
+            on_peer_down=[
+                NotificationAction(channel="nonexistent", message="Peer down!"),
+            ],
+        )
+        errors = config.validate()
+        assert any("nonexistent" in e and "on_peer_down" in e for e in errors)

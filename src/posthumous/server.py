@@ -681,7 +681,18 @@ class Server:
         return web.json_response({'success': True})
 
     async def handle_sync_state(self, request: web.Request) -> web.Response:
-        """Return current state for peer sync."""
+        """Return current state for peer sync (authenticated)."""
+        ts = request.query.get('ts')
+        sig = request.query.get('sig')
+
+        if not ts or not sig:
+            return web.json_response({'error': 'Authentication required'}, status=401)
+
+        error = self._verify_sync_message(ts, sig, "state")
+        if error:
+            logger.warning(f"Sync state request rejected: {error}")
+            return web.json_response({'error': error}, status=401)
+
         state = self.state_manager.state
 
         return web.json_response({

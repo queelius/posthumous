@@ -339,7 +339,7 @@ class TestPeerManagerSync:
                 pass
 
         mock_session = MagicMock()
-        mock_session.get = lambda url: MockGetContextManager(url)
+        mock_session.get = lambda url, **kwargs: MockGetContextManager(url)
         mock_session.closed = False
         mock_session.close = AsyncMock()
         manager._session = mock_session
@@ -702,7 +702,7 @@ class TestPeerSyncExtended:
 
         original_get = manager._get
 
-        async def mock_get(peer_url, endpoint):
+        async def mock_get(peer_url, endpoint, **kwargs):
             return state_data, None
 
         manager._get = mock_get
@@ -730,7 +730,7 @@ class TestPeerSyncExtended:
 
         manager.get_all_peer_status = AsyncMock(return_value=statuses)
 
-        async def mock_get(peer_url, endpoint):
+        async def mock_get(peer_url, endpoint, **kwargs):
             return None, "Connection refused"
 
         manager._get = mock_get
@@ -770,7 +770,7 @@ class TestPeerSyncExtended:
             },
         }
 
-        async def mock_get(peer_url, endpoint):
+        async def mock_get(peer_url, endpoint, **kwargs):
             return state_data, None
 
         manager._get = mock_get
@@ -1048,6 +1048,207 @@ class TestPeerHealthMonitoring:
         await manager.close()
 
 
+class TestPeerDownCallback:
+    """Tests for on_peer_down callback in health check."""
+
+    @pytest.fixture
+    def config(self):
+        return Config(
+            node_name="test",
+            secret_key="JBSWY3DPEHPK3PXP",
+            peers=["https://peer1.local:8420"],
+            peer_check_interval=timedelta(seconds=0.05),
+            peer_down_threshold=timedelta(seconds=1),
+        )
+
+    @pytest.fixture
+    def state_manager(self, tmp_path):
+        return StateManager(tmp_path / "state.yaml")
+
+    @pytest.mark.asyncio
+    async def test_callback_fires_when_peer_exceeds_threshold(self, config, state_manager):
+        """on_peer_down callback should fire when a peer exceeds the down threshold."""
+        callback_calls = []
+
+        async def on_peer_down(peer_url, downtime, last_seen):
+            callback_calls.append((peer_url, downtime, last_seen))
+
+        manager = PeerManager(config, state_manager, on_peer_down=on_peer_down)
+
+        peer_url = "https://peer1.local:8420"
+        now = datetime.now(timezone.utc)
+
+        # Pre-populate peer state with last_seen well past the threshold
+        state_manager.state.update_peer(peer_url, success=True)
+        state_manager.state.peer_states[peer_url].last_seen = now - timedelta(hours=12)
+
+        # Peer is unreachable
+        down_statuses = [
+            PeerStatus(
+                url=peer_url,
+                reachable=False,
+                status=None,
+                last_checkin=None,
+                last_seen=None,
+                error="Connection refused",
+            ),
+        ]
+
+        manager.get_all_peer_status = AsyncMock(return_value=down_statuses)
+
+        # Run one health check iteration via _health_check_once
+        await manager._health_check_once()
+
+        assert len(callback_calls) == 1
+        assert callback_calls[0][0] == peer_url
+        assert callback_calls[0][1] >= timedelta(hours=12)
+
+        await manager.close()
+
+    @pytest.mark.asyncio
+    async def test_callback_does_not_repeat(self, config, state_manager):
+        """Callback should only fire once per down episode."""
+        callback_calls = []
+
+        async def on_peer_down(peer_url, downtime, last_seen):
+            callback_calls.append(peer_url)
+
+        manager = PeerManager(config, state_manager, on_peer_down=on_peer_down)
+
+        peer_url = "https://peer1.local:8420"
+        now = datetime.now(timezone.utc)
+
+        state_manager.state.update_peer(peer_url, success=True)
+        state_manager.state.peer_states[peer_url].last_seen = now - timedelta(hours=12)
+
+        down_statuses = [
+            PeerStatus(
+                url=peer_url,
+                reachable=False,
+                status=None,
+                last_checkin=None,
+                last_seen=None,
+                error="Connection refused",
+            ),
+        ]
+
+        manager.get_all_peer_status = AsyncMock(return_value=down_statuses)
+
+        # Run two health check iterations
+        await manager._health_check_once()
+        await manager._health_check_once()
+
+        # Callback should have fired only once
+        assert len(callback_calls) == 1
+
+        await manager.close()
+
+    @pytest.mark.asyncio
+    async def test_callback_clears_on_recovery(self, config, state_manager):
+        """Alert state should clear when peer recovers, allowing re-alert."""
+        callback_calls = []
+
+        async def on_peer_down(peer_url, downtime, last_seen):
+            callback_calls.append(peer_url)
+
+        manager = PeerManager(config, state_manager, on_peer_down=on_peer_down)
+
+        peer_url = "https://peer1.local:8420"
+        now = datetime.now(timezone.utc)
+
+        state_manager.state.update_peer(peer_url, success=True)
+        state_manager.state.peer_states[peer_url].last_seen = now - timedelta(hours=12)
+
+        # Phase 1: peer down -> callback fires
+        down_statuses = [
+            PeerStatus(
+                url=peer_url, reachable=False, status=None,
+                last_checkin=None, last_seen=None, error="refused",
+            ),
+        ]
+        manager.get_all_peer_status = AsyncMock(return_value=down_statuses)
+        await manager._health_check_once()
+        assert len(callback_calls) == 1
+        assert peer_url in manager._alerted_peers
+
+        # Phase 2: peer recovers -> alert state clears
+        up_statuses = [
+            PeerStatus(
+                url=peer_url, reachable=True, status="armed",
+                last_checkin=now, last_seen=now,
+            ),
+        ]
+        manager.get_all_peer_status = AsyncMock(return_value=up_statuses)
+        await manager._health_check_once()
+        assert peer_url not in manager._alerted_peers
+
+        # Phase 3: peer goes down again -> callback fires again
+        state_manager.state.peer_states[peer_url].last_seen = now - timedelta(hours=6)
+        manager.get_all_peer_status = AsyncMock(return_value=down_statuses)
+        await manager._health_check_once()
+        assert len(callback_calls) == 2
+
+        await manager.close()
+
+    @pytest.mark.asyncio
+    async def test_no_callback_if_not_set(self, config, state_manager):
+        """PeerManager without callback should not crash on peer down."""
+        manager = PeerManager(config, state_manager)  # no on_peer_down
+
+        peer_url = "https://peer1.local:8420"
+        now = datetime.now(timezone.utc)
+
+        state_manager.state.update_peer(peer_url, success=True)
+        state_manager.state.peer_states[peer_url].last_seen = now - timedelta(hours=12)
+
+        down_statuses = [
+            PeerStatus(
+                url=peer_url, reachable=False, status=None,
+                last_checkin=None, last_seen=None, error="refused",
+            ),
+        ]
+        manager.get_all_peer_status = AsyncMock(return_value=down_statuses)
+
+        # Should not raise
+        await manager._health_check_once()
+        assert peer_url in manager._alerted_peers
+
+        await manager.close()
+
+    @pytest.mark.asyncio
+    async def test_no_callback_below_threshold(self, config, state_manager):
+        """Callback should not fire if peer downtime is below the threshold."""
+        callback_calls = []
+
+        async def on_peer_down(peer_url, downtime, last_seen):
+            callback_calls.append(peer_url)
+
+        # Use a large threshold so 5 minutes of downtime won't trigger it
+        config.peer_down_threshold = timedelta(hours=6)
+        manager = PeerManager(config, state_manager, on_peer_down=on_peer_down)
+
+        peer_url = "https://peer1.local:8420"
+        now = datetime.now(timezone.utc)
+
+        state_manager.state.update_peer(peer_url, success=True)
+        state_manager.state.peer_states[peer_url].last_seen = now - timedelta(minutes=5)
+
+        down_statuses = [
+            PeerStatus(
+                url=peer_url, reachable=False, status=None,
+                last_checkin=None, last_seen=None, error="refused",
+            ),
+        ]
+        manager.get_all_peer_status = AsyncMock(return_value=down_statuses)
+
+        await manager._health_check_once()
+
+        assert len(callback_calls) == 0
+        assert peer_url not in manager._alerted_peers
+
+        await manager.close()
+
+
 class TestPeerEdgeCases:
     """Edge-case tests for uncovered PeerManager paths."""
 
@@ -1111,11 +1312,67 @@ class TestPeerEdgeCases:
                     "status": "invalid-status-value-that-will-cause-exception",
                     "last_checkin": datetime.now(timezone.utc).isoformat(),
                 },
+                repeat=True,
             )
 
             result = await manager.sync_state_from_peers()
 
         # Should return False because Status("invalid-status-value...") raises ValueError
         assert result is False
+
+        await manager.close()
+
+    @pytest.mark.asyncio
+    async def test_sync_state_sends_signed_request(self, config, state_manager):
+        """sync_state_from_peers should send ts and sig query params."""
+        import re
+        from urllib.parse import unquote
+        from aioresponses import aioresponses
+        from posthumous.auth import verify_signature
+
+        manager = PeerManager(config, state_manager)
+
+        with aioresponses() as m:
+            m.get(
+                "http://peer1:8420/status",
+                payload={
+                    "status": "armed",
+                    "last_checkin": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            # Use pattern matching to capture requests with query params
+            m.get(
+                re.compile(r"http://peer1:8420/sync/state"),
+                payload={
+                    "node_name": "peer1",
+                    "status": "armed",
+                    "last_checkin": datetime.now(timezone.utc).isoformat(),
+                    "trigger_time": None,
+                    "schedule_state": {},
+                },
+            )
+
+            result = await manager.sync_state_from_peers()
+
+            assert result is True
+
+            # Find the sync/state request URL from captured requests
+            # m.requests keys are (method, yarl.URL) tuples
+            sync_state_urls = [
+                url for (method, url) in m.requests
+                if "sync/state" in str(url)
+            ]
+
+            assert len(sync_state_urls) > 0, "Expected at least one call to sync/state"
+            request_url = sync_state_urls[0]
+
+            # aioresponses may double-encode query params, so decode them
+            ts = unquote(request_url.query.get("ts", ""))
+            sig = request_url.query.get("sig", "")
+            assert ts, f"Expected 'ts' query param, got URL: {request_url}"
+            assert sig, f"Expected 'sig' query param, got URL: {request_url}"
+
+            # Verify the signature is valid
+            assert verify_signature(config.secret_key, f"state:{ts}", sig)
 
         await manager.close()

@@ -101,6 +101,7 @@ class Config:
     on_warning: list[NotificationAction | ScriptAction] = field(default_factory=list)
     on_grace: list[NotificationAction | ScriptAction] = field(default_factory=list)
     on_trigger: list[NotificationAction | ScriptAction] = field(default_factory=list)
+    on_peer_down: list[NotificationAction | ScriptAction] = field(default_factory=list)
 
     # Post-trigger schedule
     post_trigger: list[ScheduledItem] = field(default_factory=list)
@@ -219,6 +220,7 @@ class Config:
             on_warning=parse_actions(actions_config.get('on_warning')),
             on_grace=parse_actions(actions_config.get('on_grace')),
             on_trigger=parse_actions(actions_config.get('on_trigger')),
+            on_peer_down=parse_actions(actions_config.get('on_peer_down')),
             post_trigger=parse_scheduled(data.get('post_trigger')),
             api_token=data.get('api_token'),
             max_failed_attempts=data.get('max_failed_attempts', 5),
@@ -295,6 +297,8 @@ class Config:
             actions['on_grace'] = serialize_actions(self.on_grace)
         if self.on_trigger:
             actions['on_trigger'] = serialize_actions(self.on_trigger)
+        if self.on_peer_down:
+            actions['on_peer_down'] = serialize_actions(self.on_peer_down)
         if actions:
             data['actions'] = actions
 
@@ -413,6 +417,7 @@ class Config:
         check_actions(self.on_warning, 'on_warning')
         check_actions(self.on_grace, 'on_grace')
         check_actions(self.on_trigger, 'on_trigger')
+        check_actions(self.on_peer_down, 'on_peer_down')
 
         for item in self.post_trigger:
             if item.notify and item.notify not in all_channels:

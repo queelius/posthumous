@@ -8,7 +8,7 @@ import os
 import signal
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import click
@@ -167,6 +167,75 @@ def edit(ctx: click.Context) -> None:
         click.echo(f"Failed to parse config: {e}", err=True)
 
 
+@main.group()
+def service():
+    """Manage the systemd service."""
+    pass
+
+
+@service.command()
+@click.pass_context
+def install(ctx: click.Context) -> None:
+    """Install and start the systemd user service."""
+    from posthumous.config import Config
+    from posthumous.systemd import generate_unit_file, get_unit_path
+
+    config_path = _resolve_config_path(ctx)
+    if not config_path.exists():
+        click.echo(f"Config not found at {config_path}", err=True)
+        sys.exit(1)
+
+    config = Config.from_yaml(config_path)
+    unit_content = generate_unit_file(
+        python_path=sys.executable,
+        config_path=str(config_path.resolve()),
+        node_name=config.node_name,
+    )
+
+    unit_path = get_unit_path()
+    unit_path.parent.mkdir(parents=True, exist_ok=True)
+    unit_path.write_text(unit_content)
+    click.echo(f"Unit file written to {unit_path}")
+
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "--user", "enable", "posthumous"], check=True)
+    subprocess.run(["systemctl", "--user", "start", "posthumous"], check=True)
+    click.echo("Service installed, enabled, and started.")
+
+
+@service.command()
+def uninstall() -> None:
+    """Stop, disable, and remove the systemd user service."""
+    from posthumous.systemd import get_unit_path
+
+    unit_path = get_unit_path()
+    if not unit_path.exists():
+        click.echo("Service is not installed.", err=True)
+        sys.exit(1)
+
+    subprocess.run(["systemctl", "--user", "stop", "posthumous"], check=False)
+    subprocess.run(["systemctl", "--user", "disable", "posthumous"], check=False)
+    unit_path.unlink()
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    click.echo("Service stopped, disabled, and removed.")
+
+
+@service.command('status')
+def service_status() -> None:
+    """Show systemd service status."""
+    subprocess.run(["systemctl", "--user", "status", "posthumous"])
+
+
+@service.command()
+@click.option('--follow', '-f', is_flag=True, help='Follow log output')
+def logs(follow: bool) -> None:
+    """Show service journal logs."""
+    cmd = ["journalctl", "--user", "-u", "posthumous", "--no-pager"]
+    if follow:
+        cmd.append("-f")
+    subprocess.run(cmd)
+
+
 @main.command()
 @click.option('--node-name', prompt='Node name', help='Name for this node')
 @click.option('--join', 'join_url', help='URL of existing node to join')
@@ -240,9 +309,10 @@ def init(ctx: click.Context, node_name: str, join_url: str | None) -> None:
 
 
 @main.command()
-@click.option('--daemon', '-d', is_flag=True, help='Run in background (daemon mode)')
+@click.option('--daemon', '-d', is_flag=True, help='Run in background')
+@click.option('--stop', is_flag=True, help='Stop a running daemon')
 @click.pass_context
-def run(ctx: click.Context, daemon: bool) -> None:
+def run(ctx: click.Context, daemon: bool, stop: bool) -> None:
     """Start the Posthumous daemon."""
     from posthumous.config import Config
     from posthumous.state import StateManager
@@ -263,6 +333,28 @@ def run(ctx: click.Context, daemon: bool) -> None:
 
     # Load config
     config = Config.from_yaml(config_path)
+
+    # Handle --stop before validation (just need config_dir for PID file)
+    if stop:
+        import time
+        pid_path = config.config_dir / "posthumous.pid"
+        if not pid_path.exists():
+            click.echo("No PID file found. Is the daemon running?", err=True)
+            sys.exit(1)
+        pid = int(pid_path.read_text().strip())
+        os.kill(pid, signal.SIGTERM)
+        click.echo(f"Sent SIGTERM to PID {pid}")
+        for _ in range(20):
+            try:
+                os.kill(pid, 0)
+                time.sleep(0.5)
+            except ProcessLookupError:
+                pid_path.unlink(missing_ok=True)
+                click.echo("Daemon stopped.")
+                return
+        click.echo(f"Process {pid} still running. Try: kill -9 {pid}", err=True)
+        sys.exit(1)
+
     errors = config.validate()
     if errors:
         click.echo("Configuration errors:", err=True)
@@ -275,6 +367,33 @@ def run(ctx: click.Context, daemon: bool) -> None:
     setup_logging(ctx.obj.get('verbose', False), log_file)
     logger = logging.getLogger(__name__)
 
+    # Pre-flight: check state file integrity before constructing StateManager
+    from posthumous.state import State, StateCorruptError
+    state_path = config.config_dir / "state.yaml"
+    encryption_secret = config.get_encryption_secret()
+
+    if state_path.exists():
+        try:
+            State.load(state_path, encryption_secret)
+        except StateCorruptError:
+            logger.warning("State file is corrupt, attempting peer recovery...")
+            temp_manager = StateManager(state_path, encryption_secret)
+            temp_peer = PeerManager(config, temp_manager)
+
+            async def attempt_recovery():
+                try:
+                    recovered = await temp_peer.sync_state_from_peers()
+                    if recovered:
+                        logger.info("State recovered from peer")
+                    else:
+                        logger.warning("No peers available, starting with fresh state")
+                except Exception as e:
+                    logger.warning(f"Peer recovery failed: {e}, starting with fresh state")
+                finally:
+                    await temp_peer.close()
+
+            asyncio.run(attempt_recovery())
+
     # Initialize components
     state_manager = StateManager(config.config_dir / "state.yaml", config.get_encryption_secret())
     notification_manager = NotificationManager(config.notifications)
@@ -286,9 +405,6 @@ def run(ctx: click.Context, daemon: bool) -> None:
         lockout_duration=config.lockout_duration,
     )
 
-    # Peer manager
-    peer_manager = PeerManager(config, state_manager)
-
     # Action callbacks
     from posthumous.config import NotificationAction, ScriptAction
 
@@ -298,6 +414,7 @@ def run(ctx: click.Context, daemon: bool) -> None:
         title: str,
         actions: list,
         trigger_time: datetime | None = None,
+        extra_context: dict[str, str] | None = None,
     ) -> None:
         """Execute a list of notification and script actions."""
         logger.info(f"{title} - executing actions")
@@ -310,6 +427,8 @@ def run(ctx: click.Context, daemon: bool) -> None:
             trigger_at=config.trigger_at,
             base_url=config.get_base_url(),
         )
+        if extra_context:
+            context.update(extra_context)
 
         for action in actions:
             if isinstance(action, NotificationAction):
@@ -326,6 +445,21 @@ def run(ctx: click.Context, daemon: bool) -> None:
                     last_checkin=state_manager.state.last_checkin,
                 )
                 await script_runner.run(action.script, script_context)
+
+    async def on_peer_down(peer_url: str, downtime: timedelta, last_seen: datetime):
+        from posthumous.server import _format_duration
+        await execute_actions(
+            "peer_down", state_manager.state.status.value,
+            "Posthumous - Peer Down", config.on_peer_down,
+            extra_context={
+                'peer_url': peer_url,
+                'peer_downtime': _format_duration(downtime),
+                'peer_last_seen': last_seen.isoformat() if last_seen else 'unknown',
+            },
+        )
+
+    # Peer manager
+    peer_manager = PeerManager(config, state_manager, on_peer_down=on_peer_down)
 
     async def on_warning():
         await execute_actions("warning", "warning", "Posthumous Warning", config.on_warning)
@@ -387,14 +521,32 @@ def run(ctx: click.Context, daemon: bool) -> None:
         watchdog.start()
         scheduler.start()
 
+        from posthumous.systemd import notify_ready, notify_watchdog, notify_stopping
+        notify_ready()
+        logger.info("sd_notify: READY=1")
+
         logger.info(f"Posthumous node '{config.node_name}' started")
         logger.info(f"Status: {state_manager.state.status.value}")
         logger.info(f"Web UI: http://{config.listen}/")
+
+        async def watchdog_ping():
+            while not stop_event.is_set():
+                notify_watchdog()
+                await asyncio.sleep(15)
+
+        watchdog_task = asyncio.create_task(watchdog_ping())
 
         # Wait for shutdown
         await stop_event.wait()
 
         # Cleanup
+        notify_stopping()
+        watchdog_task.cancel()
+        try:
+            await watchdog_task
+        except asyncio.CancelledError:
+            pass
+
         logger.info("Shutting down...")
         await peer_manager.stop_health_monitoring()
         await scheduler.stop()
@@ -404,7 +556,34 @@ def run(ctx: click.Context, daemon: bool) -> None:
         logger.info("Shutdown complete")
 
     if daemon:
-        click.echo("Daemon mode not yet implemented. Running in foreground.")
+        from posthumous.systemd import is_service_installed
+        if is_service_installed():
+            click.echo("Systemd service is installed. Use 'phm service start' instead.")
+            sys.exit(0)
+
+        # Double-fork daemonization
+        pid = os.fork()
+        if pid > 0:
+            sys.exit(0)
+        os.setsid()
+        pid = os.fork()
+        if pid > 0:
+            sys.exit(0)
+
+        # Redirect stdio
+        devnull = os.open(os.devnull, os.O_RDWR)
+        os.dup2(devnull, 0)
+        log_path = config.config_dir / "logs" / "daemon.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.dup2(log_fd, 1)
+        os.dup2(log_fd, 2)
+        os.close(devnull)
+        os.close(log_fd)
+
+        # Write PID file
+        pid_path = config.config_dir / "posthumous.pid"
+        pid_path.write_text(str(os.getpid()))
 
     click.echo(f"Starting Posthumous node '{config.node_name}'...")
     try:
@@ -556,6 +735,66 @@ def reset(ctx: click.Context, force: bool) -> None:
 
     state_manager.reset()
     click.echo("State reset to ARMED.")
+
+
+@main.command()
+@click.option('--force', is_flag=True, help='Skip confirmation prompt')
+@click.pass_context
+def recover(ctx: click.Context, force: bool) -> None:
+    """Recover state from the healthiest peer."""
+    from posthumous.config import Config
+    from posthumous.state import StateManager
+    from posthumous.peers import PeerManager
+
+    config_path = _resolve_config_path(ctx)
+    if not config_path.exists():
+        click.echo(f"Config not found at {config_path}", err=True)
+        sys.exit(1)
+
+    config = Config.from_yaml(config_path)
+    state_manager = StateManager(config.config_dir / "state.yaml", config.get_encryption_secret())
+
+    async def do_recover():
+        peer_manager = PeerManager(config, state_manager)
+        try:
+            if not force:
+                # Show local state
+                local = state_manager.state
+                click.echo("Local state:")
+                click.echo(f"  status:       {local.status.value}")
+                click.echo(f"  last_checkin: {local.last_checkin or 'never'}")
+                click.echo(f"  trigger_time: {local.trigger_time or 'none'}")
+                click.echo(f"  schedule:     {len(local.schedule_state)} items")
+
+                # Fetch peer state for comparison
+                statuses = await peer_manager.get_all_peer_status()
+                best = max(
+                    (s for s in statuses if s.reachable and s.last_checkin),
+                    key=lambda s: s.last_checkin, default=None,
+                )
+                if best:
+                    click.echo(f"\nPeer state ({best.url}):")
+                    click.echo(f"  status:       {best.status or 'unknown'}")
+                    click.echo(f"  last_checkin: {best.last_checkin or 'never'}")
+                else:
+                    click.echo("\nNo reachable peers with state to compare.")
+                    return
+
+                click.echo()
+                if not click.confirm("Overwrite local state from peer?"):
+                    click.echo("Aborted.")
+                    return
+
+            success = await peer_manager.sync_state_from_peers()
+            if success:
+                click.echo("State recovered from peer successfully.")
+            else:
+                click.echo("No peers available for recovery.", err=True)
+                sys.exit(1)
+        finally:
+            await peer_manager.close()
+
+    asyncio.run(do_recover())
 
 
 @main.command()
