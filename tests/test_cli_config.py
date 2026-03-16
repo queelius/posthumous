@@ -79,7 +79,7 @@ class TestConfigShow:
         # Full secret should NOT appear
         assert "JBSWY3DPEHPK3PXP" not in result.output
         # Redacted form should appear
-        assert "JBSW****PXP" in result.output
+        assert "JBSW****" in result.output
 
     def test_shows_node_name(self, runner, valid_config_dir):
         config_path = valid_config_dir / "config.yaml"
@@ -260,7 +260,7 @@ class TestConfigEdit:
 class TestRedactSecret:
     def test_redacts_normal_secret(self):
         from posthumous.cli import _redact_secret
-        assert _redact_secret("JBSWY3DPEHPK3PXP") == "JBSW****PXP"
+        assert _redact_secret("JBSWY3DPEHPK3PXP") == "JBSW****"
 
     def test_redacts_short_secret(self):
         from posthumous.cli import _redact_secret

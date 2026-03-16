@@ -301,6 +301,21 @@ class Config:
         if self.post_trigger:
             data['post_trigger'] = serialize_scheduled(self.post_trigger)
 
+        if self.check_interval is not None:
+            data['check_interval'] = format_duration(self.check_interval)
+
+        if self.max_failed_attempts != 5:
+            data['max_failed_attempts'] = self.max_failed_attempts
+
+        if self.lockout_duration != timedelta(minutes=15):
+            data['lockout_duration'] = format_duration(self.lockout_duration)
+
+        if self.peer_check_interval != timedelta(minutes=30):
+            data['peer_check_interval'] = format_duration(self.peer_check_interval)
+
+        if self.peer_down_threshold != timedelta(hours=6):
+            data['peer_down_threshold'] = format_duration(self.peer_down_threshold)
+
         if self.api_token:
             data['api_token'] = self.api_token
 

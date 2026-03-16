@@ -61,10 +61,10 @@ def _resolve_config_path(ctx: click.Context) -> Path:
 
 
 def _redact_secret(secret: str) -> str:
-    """Redact a secret key, showing first 4 and last 3 characters."""
-    if len(secret) <= 7:
+    """Redact a secret key, showing only the first 4 characters."""
+    if len(secret) <= 4:
         return "****"
-    return secret[:4] + "****" + secret[-3:]
+    return secret[:4] + "****"
 
 
 @main.group()
@@ -380,11 +380,12 @@ def run(ctx: click.Context, daemon: bool) -> None:
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, handle_signal)
 
-        # Start components
+        # Start components. Order matters: server must be ready before watchdog,
+        # which may fire callbacks that broadcast to peers via peer_manager.
         await server.start()
+        peer_manager.start_health_monitoring()
         watchdog.start()
         scheduler.start()
-        peer_manager.start_health_monitoring()
 
         logger.info(f"Posthumous node '{config.node_name}' started")
         logger.info(f"Status: {state_manager.state.status.value}")
@@ -518,7 +519,7 @@ def status(ctx: click.Context) -> None:
             peer_state = state.peer_states.get(url)
             if peer_state and peer_state.last_seen:
                 age = datetime.now(timezone.utc) - peer_state.last_seen
-                click.echo(f"  {url}: seen {age.seconds // 60}m ago")
+                click.echo(f"  {url}: seen {int(age.total_seconds()) // 60}m ago")
             else:
                 click.echo(f"  {url}: unknown")
 
@@ -626,10 +627,9 @@ def test_notify(ctx: click.Context, channel: str | None) -> None:
 
 
 @main.command('test-trigger')
-@click.option('--dry-run', is_flag=True, default=True, help='Do not actually execute actions')
 @click.pass_context
-def test_trigger(ctx: click.Context, dry_run: bool) -> None:
-    """Test trigger actions (dry run)."""
+def test_trigger(ctx: click.Context) -> None:
+    """Show what would happen on trigger (always dry run)."""
     from posthumous.config import Config, NotificationAction, ScriptAction
 
     config_path = ctx.obj.get('config_path') or Config.get_default_config_path()

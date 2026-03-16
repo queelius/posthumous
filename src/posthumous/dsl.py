@@ -24,7 +24,7 @@ class ScheduleType(Enum):
 class ParsedSchedule:
     """Parsed schedule expression."""
     schedule_type: ScheduleType
-    offset: timedelta | None = None  # Offset from trigger or base date
+    offset: timedelta | relativedelta | None = None  # Offset from trigger or base date
     interval: timedelta | relativedelta | None = None  # For recurring
     month: int | None = None  # For absolute recurring (1-12)
     day: int | None = None  # For absolute recurring (1-31)
@@ -69,7 +69,7 @@ class NextOccurrence(NamedTuple):
     period_key: str
 
 
-def parse_duration(text: str) -> timedelta:
+def parse_duration(text: str) -> timedelta | relativedelta:
     """Parse a duration like '3 days', '1 week', '12 hours'."""
     text = text.strip().lower()
 
@@ -176,7 +176,7 @@ def parse_when_expression(expression: str) -> ParsedSchedule:
             duration = -duration
         return ParsedSchedule(
             schedule_type=ScheduleType.TRIGGER_RELATIVE,
-            offset=duration if isinstance(duration, timedelta) else timedelta(days=365),  # Approximate year
+            offset=duration,
             raw_expression=original,
         )
 
