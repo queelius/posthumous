@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -76,11 +77,11 @@ class NotificationManager:
         """
         context = context or {}
 
-        # Safe formatting that ignores missing keys
+        # Safe formatting that substitutes missing keys with "N/A"
         try:
-            return template.format(**context)
-        except KeyError as e:
-            logger.warning(f"Missing template variable: {e}")
+            return template.format_map(defaultdict(lambda: "N/A", context))
+        except (KeyError, ValueError, IndexError) as e:
+            logger.warning(f"Error formatting template: {e}")
             return template
 
     async def send(

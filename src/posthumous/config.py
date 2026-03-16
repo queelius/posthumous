@@ -83,7 +83,7 @@ class Config:
     # Identity
     node_name: str
     secret_key: str
-    listen: str = "0.0.0.0:8420"
+    listen: str = "127.0.0.1:8420"
 
     # Timing
     checkin_interval: timedelta = field(default_factory=lambda: timedelta(days=7))
@@ -209,7 +209,7 @@ class Config:
         return cls(
             node_name=data['node_name'],
             secret_key=data['secret_key'],
-            listen=data.get('listen', '0.0.0.0:8420'),
+            listen=data.get('listen', '127.0.0.1:8420'),
             checkin_interval=get_duration('checkin_interval', timedelta(days=7)),
             warning_start=get_duration('warning_start', timedelta(days=8)),
             grace_start=get_duration('grace_start', timedelta(days=12)),
@@ -324,6 +324,7 @@ class Config:
             with os.fdopen(fd, 'w') as f:
                 yaml.dump(self.to_dict(), f, default_flow_style=False, sort_keys=False)
             os.replace(temp_path, path)
+            os.chmod(path, 0o600)
         except Exception:
             try:
                 os.unlink(temp_path)
@@ -342,12 +343,15 @@ class Config:
         host = self.listen.replace('0.0.0.0', 'localhost')
         return f"http://{host}"
 
-    def get_encryption_key(self) -> bytes | None:
-        """Get the encryption key for state files, or None if encryption is disabled."""
+    def get_encryption_secret(self) -> str | None:
+        """Get the encryption secret for state files, or None if encryption is disabled.
+
+        Returns the raw secret_key string, which crypto functions use internally
+        for PBKDF2 key derivation with per-file salts.
+        """
         if not self.encrypt_at_rest:
             return None
-        from posthumous.crypto import derive_key
-        return derive_key(self.secret_key)
+        return self.secret_key
 
     def get_script_path(self, script: str) -> Path:
         """Resolve a script path relative to config directory."""

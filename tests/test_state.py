@@ -432,36 +432,75 @@ class TestStateEdgeCases:
                 state.save(state_path)
 
 
+class TestTriggerTimestampPropagation:
+    """Tests for trigger timestamp propagation (I1)."""
+
+    def test_transition_to_triggered_with_explicit_time(self):
+        """Peer trigger should use the peer's timestamp, not now()."""
+        state = State()
+        state.status = Status.GRACE
+        peer_time = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+        state.transition_to(Status.TRIGGERED, trigger_time=peer_time)
+        assert state.trigger_time == peer_time
+
+    def test_transition_to_triggered_defaults_to_now(self):
+        """Local trigger should default to now() when no trigger_time given."""
+        state = State()
+        state.status = Status.GRACE
+        before = datetime.now(timezone.utc)
+        state.transition_to(Status.TRIGGERED)
+        assert state.trigger_time >= before
+
+    def test_state_manager_transition_passes_trigger_time(self, tmp_path):
+        """StateManager.transition() should forward trigger_time to State."""
+        state_path = tmp_path / "state.yaml"
+        manager = StateManager(state_path)
+        manager.state.status = Status.GRACE
+
+        peer_time = datetime(2026, 3, 10, 8, 30, 0, tzinfo=timezone.utc)
+        manager.transition(Status.TRIGGERED, trigger_time=peer_time)
+
+        assert manager.state.trigger_time == peer_time
+
+        # Verify it persisted
+        loaded = State.load(state_path)
+        assert loaded.trigger_time == peer_time
+
+    def test_non_triggered_transition_ignores_trigger_time(self):
+        """trigger_time parameter should be ignored for non-TRIGGERED transitions."""
+        state = State()
+        bogus_time = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        state.transition_to(Status.WARNING, trigger_time=bogus_time)
+        assert state.trigger_time is None
+
+
 class TestStateEncryption:
     """Tests for encrypted state save/load paths."""
 
     def test_save_and_load_encrypted(self, tmp_path):
         """State round-trips through encrypted save/load."""
-        from posthumous.crypto import derive_key
-
-        key = derive_key("test-secret")
+        secret = "test-secret"
         state_path = tmp_path / "state.yaml"
 
         state = State()
         state.record_checkin()
-        state.save(state_path, encryption_key=key)
+        state.save(state_path, encryption_secret=secret)
 
         # File should be encrypted on disk
         raw = state_path.read_bytes()
         from posthumous.crypto import is_encrypted
         assert is_encrypted(raw)
 
-        # Load back with encryption key
-        loaded = State.load(state_path, encryption_key=key)
+        # Load back with encryption secret
+        loaded = State.load(state_path, encryption_secret=secret)
         assert loaded.status == Status.ARMED
         assert loaded.last_checkin is not None
 
-    def test_load_plaintext_with_encryption_key(self, tmp_path):
-        """Loading a plaintext file with encryption_key should work (migration)."""
-        from posthumous.crypto import derive_key
+    def test_load_plaintext_with_encryption_secret(self, tmp_path):
+        """Loading a plaintext file with encryption_secret should work (migration)."""
         import yaml
 
-        key = derive_key("test-secret")
+        secret = "test-secret"
         state_path = tmp_path / "state.yaml"
 
         # Write plaintext state
@@ -469,7 +508,7 @@ class TestStateEncryption:
         state_path.write_text(yaml.dump(data))
 
         # Should load fine (decrypt_file handles plaintext transparently)
-        loaded = State.load(state_path, encryption_key=key)
+        loaded = State.load(state_path, encryption_secret=secret)
         assert loaded.status == Status.ARMED
 
 
@@ -516,3 +555,15 @@ class TestFromDictBranchPartials:
         state = State.from_dict(data)
         assert "http://good:8420" in state.peer_states
         assert "http://bad:8420" not in state.peer_states
+
+
+class TestStateFilePermissions:
+    """Tests for restrictive file permissions on saved state files."""
+
+    def test_state_save_sets_restrictive_permissions(self, tmp_path):
+        import stat
+        state = State()
+        path = tmp_path / "state.yaml"
+        state.save(path)
+        mode = stat.S_IMODE(path.stat().st_mode)
+        assert mode == 0o600

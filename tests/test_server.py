@@ -72,6 +72,13 @@ def generate_totp() -> str:
     return pyotp.TOTP(SECRET, issuer="Posthumous").now()
 
 
+async def get_csrf_token(client) -> str:
+    """GET /checkin and extract the CSRF token from the cookie."""
+    resp = await client.get("/checkin")
+    cookies = {c.key: c for c in resp.cookies.values()}
+    return cookies["csrf_token"].value
+
+
 class TestHealthEndpoint:
     """Tests for GET /health."""
 
@@ -261,10 +268,11 @@ class TestCheckinForm:
 
     @pytest.mark.asyncio
     async def test_valid_totp_form_returns_html(self, client):
+        csrf = await get_csrf_token(client)
         code = generate_totp()
         resp = await client.post(
             "/checkin",
-            data={"totp": code},
+            data={"totp": code, "csrf_token": csrf},
         )
 
         assert resp.status == 200
@@ -274,9 +282,10 @@ class TestCheckinForm:
 
     @pytest.mark.asyncio
     async def test_invalid_totp_form_returns_html_error(self, client):
+        csrf = await get_csrf_token(client)
         resp = await client.post(
             "/checkin",
-            data={"totp": "000000"},
+            data={"totp": "000000", "csrf_token": csrf},
         )
 
         assert resp.status == 200
@@ -286,9 +295,10 @@ class TestCheckinForm:
 
     @pytest.mark.asyncio
     async def test_no_credentials_form_returns_html_error(self, client):
+        csrf = await get_csrf_token(client)
         resp = await client.post(
             "/checkin",
-            data={},
+            data={"csrf_token": csrf},
         )
 
         assert resp.status == 200
@@ -298,13 +308,14 @@ class TestCheckinForm:
 
     @pytest.mark.asyncio
     async def test_triggered_form_returns_html_error(self, client, state_manager):
+        csrf = await get_csrf_token(client)
         state_manager.state.status = Status.TRIGGERED
         state_manager.state.trigger_time = datetime.now(timezone.utc)
 
         code = generate_totp()
         resp = await client.post(
             "/checkin",
-            data={"totp": code},
+            data={"totp": code, "csrf_token": csrf},
         )
 
         assert resp.status == 200
@@ -314,11 +325,12 @@ class TestCheckinForm:
 
     @pytest.mark.asyncio
     async def test_lockout_form_returns_html_error(self, client, state_manager):
+        csrf = await get_csrf_token(client)
         state_manager.state.lockout_until = datetime.now(timezone.utc) + timedelta(minutes=10)
 
         resp = await client.post(
             "/checkin",
-            data={"totp": "000000"},
+            data={"totp": "000000", "csrf_token": csrf},
         )
 
         assert resp.status == 200
@@ -490,6 +502,33 @@ class TestSyncTrigger:
         assert resp.status == 400
         data = await resp.json()
         assert data["error"] == "Invalid JSON"
+
+
+class TestSyncTriggerTimestamp:
+    """Tests for trigger timestamp propagation through sync (I1)."""
+
+    @pytest.mark.asyncio
+    async def test_sync_trigger_uses_peer_timestamp(self, client, state_manager):
+        """Sync trigger should use the peer's timestamp, not now()."""
+        state_manager.state.status = Status.GRACE
+
+        # Use a fresh timestamp (within staleness window) so the request passes validation
+        peer_time = datetime.now(timezone.utc)
+        timestamp = peer_time.isoformat()
+        message = f"trigger:{timestamp}"
+        signature = sign_message(SECRET, message)
+
+        resp = await client.post(
+            "/sync/trigger",
+            json={"timestamp": timestamp, "signature": signature},
+        )
+
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["success"] is True
+        assert state_manager.state.status == Status.TRIGGERED
+        # The trigger_time should be the peer's timestamp, not a locally-generated now()
+        assert state_manager.state.trigger_time == peer_time
 
 
 class TestSyncScheduled:
@@ -935,8 +974,9 @@ class TestFormHiding:
     @pytest.mark.asyncio
     async def test_lockout_on_checkin_post(self, client, state_manager):
         """Form POST with lockout should hide form in response."""
+        csrf = await get_csrf_token(client)
         state_manager.state.lockout_until = datetime.now(timezone.utc) + timedelta(minutes=10)
-        resp = await client.post("/checkin", data={"totp": "000000"})
+        resp = await client.post("/checkin", data={"totp": "000000", "csrf_token": csrf})
         text = await resp.text()
         assert '<form' not in text
         assert "locked" in text.lower()
@@ -944,12 +984,114 @@ class TestFormHiding:
     @pytest.mark.asyncio
     async def test_triggered_checkin_post_hides_form(self, client, state_manager):
         """POST to triggered node should hide form in response."""
+        csrf = await get_csrf_token(client)
         state_manager.state.status = Status.TRIGGERED
         state_manager.state.trigger_time = datetime.now(timezone.utc)
         code = generate_totp()
-        resp = await client.post("/checkin", data={"totp": code})
+        resp = await client.post("/checkin", data={"totp": code, "csrf_token": csrf})
         text = await resp.text()
         assert '<form' not in text
+
+
+class TestSyncReplayProtection:
+    """Tests for replay protection on /sync/* endpoints."""
+
+    @pytest.mark.asyncio
+    async def test_sync_checkin_rejects_stale_timestamp(self, client):
+        """A checkin with a 10-minute-old timestamp should be rejected."""
+        stale_time = datetime.now(timezone.utc) - timedelta(minutes=10)
+        timestamp = stale_time.isoformat()
+        message = f"checkin:{timestamp}"
+        signature = sign_message(SECRET, message)
+
+        resp = await client.post(
+            "/sync/checkin",
+            json={"timestamp": timestamp, "signature": signature},
+        )
+
+        assert resp.status == 401
+        data = await resp.json()
+        assert "stale" in data["error"].lower() or "expired" in data["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_sync_checkin_accepts_fresh_timestamp(self, client, state_manager):
+        """A checkin with a current timestamp should be accepted."""
+        timestamp = datetime.now(timezone.utc).isoformat()
+        message = f"checkin:{timestamp}"
+        signature = sign_message(SECRET, message)
+
+        resp = await client.post(
+            "/sync/checkin",
+            json={"timestamp": timestamp, "signature": signature},
+        )
+
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["success"] is True
+
+    @pytest.mark.asyncio
+    async def test_sync_trigger_rejects_stale_timestamp(self, client, state_manager):
+        """A trigger with a 10-minute-old timestamp should be rejected."""
+        state_manager.state.status = Status.GRACE
+
+        stale_time = datetime.now(timezone.utc) - timedelta(minutes=10)
+        timestamp = stale_time.isoformat()
+        message = f"trigger:{timestamp}"
+        signature = sign_message(SECRET, message)
+
+        resp = await client.post(
+            "/sync/trigger",
+            json={"timestamp": timestamp, "signature": signature},
+        )
+
+        assert resp.status == 401
+        data = await resp.json()
+        assert "stale" in data["error"].lower() or "expired" in data["error"].lower()
+        # Verify trigger was NOT processed
+        assert state_manager.state.status == Status.GRACE
+
+    @pytest.mark.asyncio
+    async def test_sync_scheduled_rejects_stale_timestamp(self, client, state_manager):
+        """A scheduled completion with a 10-minute-old timestamp should be rejected."""
+        stale_time = datetime.now(timezone.utc) - timedelta(minutes=10)
+        timestamp = stale_time.isoformat()
+        item_name = "annual-backup"
+        period = "2026"
+        message = f"scheduled:{item_name}:{period}:{timestamp}"
+        signature = sign_message(SECRET, message)
+
+        resp = await client.post(
+            "/sync/scheduled",
+            json={
+                "item": item_name,
+                "period": period,
+                "timestamp": timestamp,
+                "signature": signature,
+            },
+        )
+
+        assert resp.status == 401
+        data = await resp.json()
+        assert "stale" in data["error"].lower() or "expired" in data["error"].lower()
+        # Verify item was NOT marked complete
+        assert item_name not in state_manager.state.schedule_state
+
+    @pytest.mark.asyncio
+    async def test_sync_checkin_rejects_future_timestamp(self, client):
+        """A checkin with a timestamp 10 minutes in the future should be rejected."""
+        future_time = datetime.now(timezone.utc) + timedelta(minutes=10)
+        timestamp = future_time.isoformat()
+        message = f"checkin:{timestamp}"
+        signature = sign_message(SECRET, message)
+
+        resp = await client.post(
+            "/sync/checkin",
+            json={"timestamp": timestamp, "signature": signature},
+        )
+
+        assert resp.status == 401
+        data = await resp.json()
+        assert "stale" in data["error"].lower() or "expired" in data["error"].lower()
 
 
 class TestFavicon:
@@ -967,3 +1109,57 @@ class TestFavicon:
     async def test_favicon_cache_header(self, client):
         resp = await client.get("/favicon.ico")
         assert "max-age=86400" in resp.headers.get("Cache-Control", "")
+
+
+class TestCSRFProtection:
+    """Tests for CSRF double-submit cookie on POST /checkin."""
+
+    @pytest.mark.asyncio
+    async def test_get_checkin_sets_csrf_cookie(self, client):
+        """GET /checkin should set a csrf_token cookie."""
+        resp = await client.get("/checkin")
+
+        assert resp.status == 200
+        cookies = {c.key: c for c in resp.cookies.values()}
+        assert "csrf_token" in cookies
+        assert len(cookies["csrf_token"].value) == 64  # hex(32 bytes)
+
+    @pytest.mark.asyncio
+    async def test_post_checkin_without_csrf_rejected(self, client):
+        """POST /checkin with form data but no CSRF token should return 403."""
+        resp = await client.post(
+            "/checkin",
+            data={"totp": "123456"},
+        )
+
+        assert resp.status == 403
+        text = await resp.text()
+        assert "CSRF" in text
+
+    @pytest.mark.asyncio
+    async def test_post_checkin_with_valid_csrf_accepted(self, client):
+        """POST /checkin with matching CSRF cookie and field should not return 403."""
+        # GET to obtain the CSRF token
+        get_resp = await client.get("/checkin")
+        cookies = {c.key: c for c in get_resp.cookies.values()}
+        csrf_token = cookies["csrf_token"].value
+
+        # POST with matching cookie (auto-sent by client) and form field
+        resp = await client.post(
+            "/checkin",
+            data={"totp": "123456", "csrf_token": csrf_token},
+        )
+
+        # Should NOT be 403 (may be 401 for bad TOTP, that's fine)
+        assert resp.status != 403
+
+    @pytest.mark.asyncio
+    async def test_json_api_bypasses_csrf(self, client):
+        """POST /checkin with JSON content-type should bypass CSRF check."""
+        resp = await client.post(
+            "/checkin",
+            json={"totp": "123456"},
+        )
+
+        # Should NOT be 403 (may be 401 for invalid TOTP)
+        assert resp.status != 403

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
@@ -222,6 +223,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 class Server:
     """HTTP server for check-ins and peer communication."""
 
+    SYNC_FRESHNESS_SECONDS = 300
+
     def __init__(
         self,
         config: "Config",
@@ -256,26 +259,29 @@ class Server:
         self.app.router.add_post('/sync/scheduled', self.handle_sync_scheduled)
         self.app.router.add_get('/sync/state', self.handle_sync_state)
 
-    _FORM_HTML = (
-        '<form method="POST" action="/checkin">'
-        '<input type="text" name="totp" placeholder="000000" maxlength="6" '
-        'pattern="[0-9]{{6}}" autocomplete="off" autofocus>'
-        '<button type="submit">Check In</button>'
-        '</form>'
-    )
-
     _TRIGGERED_HTML = '<div class="message error">Node is triggered. Check-in is no longer possible.</div>'
 
     _LOCKOUT_HTML = '<div class="message error">Account locked. Try again later.</div>'
 
-    def _get_form_html(self) -> str:
+    def _generate_csrf_token(self) -> str:
+        """Generate a CSRF token for double-submit cookie protection."""
+        return secrets.token_hex(32)
+
+    def _get_form_html(self, csrf_token: str = "") -> str:
         """Get the appropriate form HTML based on current state."""
         state = self.state_manager.state
         if state.status == Status.TRIGGERED:
             return self._TRIGGERED_HTML
         if state.is_locked_out():
             return self._LOCKOUT_HTML
-        return self._FORM_HTML
+        return (
+            '<form method="POST" action="/checkin">'
+            f'<input type="hidden" name="csrf_token" value="{csrf_token}">'
+            '<input type="text" name="totp" placeholder="000000" maxlength="6" '
+            'pattern="[0-9]{{6}}" autocomplete="off" autofocus>'
+            '<button type="submit">Check In</button>'
+            '</form>'
+        )
 
     def _get_time_info(self) -> str:
         """Get time info string for display."""
@@ -292,12 +298,31 @@ class Server:
 
         return f"Last check-in: {since} ago"
 
+    def _verify_sync_message(
+        self, timestamp_str: str, signature: str, message_prefix: str
+    ) -> str | None:
+        """Verify freshness and HMAC signature of a sync message.
+
+        Returns None if valid, or an error string if invalid.
+        """
+        msg_time = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+        if abs((datetime.now(timezone.utc) - msg_time).total_seconds()) > self.SYNC_FRESHNESS_SECONDS:
+            return "Stale timestamp"
+
+        from posthumous.auth import verify_signature
+        message = f"{message_prefix}:{timestamp_str}"
+        if not verify_signature(self.config.secret_key, message, signature):
+            return "Invalid signature"
+
+        return None
+
     async def handle_index(self, request: web.Request) -> web.Response:
         """Redirect to check-in form."""
         raise web.HTTPFound('/checkin')
 
     async def handle_checkin_form(self, request: web.Request) -> web.Response:
         """Render check-in form."""
+        csrf_token = self._generate_csrf_token()
         status = self.state_manager.state.status.value
         html = CHECKIN_HTML.format(
             status=status.upper(),
@@ -305,9 +330,11 @@ class Server:
             time_info=self._get_time_info(),
             node_name=self.config.node_name,
             message="",
-            form_html=self._get_form_html(),
+            form_html=self._get_form_html(csrf_token),
         )
-        return web.Response(text=html, content_type='text/html')
+        response = web.Response(text=html, content_type='text/html')
+        response.set_cookie('csrf_token', csrf_token, httponly=True, samesite='Strict')
+        return response
 
     async def handle_dashboard(self, request: web.Request) -> web.Response:
         """Render the dashboard page."""
@@ -418,6 +445,16 @@ class Server:
             data = await request.post()
             totp_code = data.get('totp')
             api_token = data.get('token')
+
+            # CSRF double-submit cookie validation for form submissions
+            csrf_cookie = request.cookies.get('csrf_token', '')
+            csrf_field = data.get('csrf_token', '')
+            if not csrf_cookie or not csrf_field or csrf_cookie != csrf_field:
+                return web.Response(
+                    text='CSRF validation failed',
+                    status=403,
+                    content_type='text/plain',
+                )
 
         # Get client identifier for rate limiting
         client_ip = request.remote or "unknown"
@@ -546,7 +583,7 @@ class Server:
 
     async def handle_favicon(self, request: web.Request) -> web.Response:
         """Return an inline SVG favicon."""
-        svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">💀</text></svg>'
+        svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">\U0001f480</text></svg>'
         return web.Response(
             body=svg.encode(),
             content_type='image/svg+xml',
@@ -562,18 +599,16 @@ class Server:
         except json.JSONDecodeError:
             return web.json_response({'error': 'Invalid JSON'}, status=400)
 
-        # Verify signature
         timestamp = data.get('timestamp')
         signature = data.get('signature')
 
         if not timestamp or not signature:
             return web.json_response({'error': 'Missing fields'}, status=400)
 
-        from posthumous.auth import verify_signature
-        message = f"checkin:{timestamp}"
-        if not verify_signature(self.config.secret_key, message, signature):
-            logger.warning("Invalid signature on sync checkin")
-            return web.json_response({'error': 'Invalid signature'}, status=401)
+        error = self._verify_sync_message(timestamp, signature, "checkin")
+        if error:
+            logger.warning(f"Sync checkin rejected: {error}")
+            return web.json_response({'error': error}, status=401)
 
         # Process check-in
         checkin_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
@@ -595,15 +630,15 @@ class Server:
         if not timestamp or not signature:
             return web.json_response({'error': 'Missing fields'}, status=400)
 
-        from posthumous.auth import verify_signature
-        message = f"trigger:{timestamp}"
-        if not verify_signature(self.config.secret_key, message, signature):
-            logger.warning("Invalid signature on sync trigger")
-            return web.json_response({'error': 'Invalid signature'}, status=401)
+        error = self._verify_sync_message(timestamp, signature, "trigger")
+        if error:
+            logger.warning(f"Sync trigger rejected: {error}")
+            return web.json_response({'error': error}, status=401)
 
-        # Mark as triggered
+        # Mark as triggered with the peer's timestamp
         from posthumous.state import Status
-        self.state_manager.transition(Status.TRIGGERED)
+        peer_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+        self.state_manager.transition(Status.TRIGGERED, trigger_time=peer_time)
         logger.info("Received trigger broadcast from peer")
 
         return web.json_response({'success': True})
@@ -617,16 +652,26 @@ class Server:
 
         item_name = data.get('item')
         period = data.get('period')
+        timestamp = data.get('timestamp')
         signature = data.get('signature')
 
         if not item_name or not period or not signature:
             return web.json_response({'error': 'Missing fields'}, status=400)
 
-        from posthumous.auth import verify_signature
-        message = f"scheduled:{item_name}:{period}"
-        if not verify_signature(self.config.secret_key, message, signature):
-            logger.warning("Invalid signature on sync scheduled")
-            return web.json_response({'error': 'Invalid signature'}, status=401)
+        if timestamp:
+            error = self._verify_sync_message(
+                timestamp, signature, f"scheduled:{item_name}:{period}"
+            )
+            if error:
+                logger.warning(f"Sync scheduled rejected: {error}")
+                return web.json_response({'error': error}, status=401)
+        else:
+            # Legacy: no timestamp, verify signature only
+            from posthumous.auth import verify_signature
+            message = f"scheduled:{item_name}:{period}"
+            if not verify_signature(self.config.secret_key, message, signature):
+                logger.warning("Invalid signature on sync scheduled")
+                return web.json_response({'error': 'Invalid signature'}, status=401)
 
         # Mark item as complete
         self.state_manager.state.mark_schedule_item_run(item_name, period)

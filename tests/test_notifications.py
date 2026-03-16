@@ -59,7 +59,15 @@ class TestMessageFormatting:
 
         # Should not raise, just return template
         result = manager.format_message("Hello {name}!", {})
-        assert result == "Hello {name}!"
+        assert result == "Hello N/A!"
+
+    def test_format_message_missing_var_shows_na(self):
+        manager = NotificationManager({})
+        result = manager.format_message(
+            "Hello {node_name}, {days_left} days left",
+            {"node_name": "test-node"}
+        )
+        assert result == "Hello test-node, N/A days left"
 
     def test_format_with_context(self):
         manager = NotificationManager({})

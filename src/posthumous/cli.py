@@ -276,7 +276,7 @@ def run(ctx: click.Context, daemon: bool) -> None:
     logger = logging.getLogger(__name__)
 
     # Initialize components
-    state_manager = StateManager(config.config_dir / "state.yaml", config.get_encryption_key())
+    state_manager = StateManager(config.config_dir / "state.yaml", config.get_encryption_secret())
     notification_manager = NotificationManager(config.notifications)
     script_runner = ScriptRunner(config.config_dir)
     authenticator = Authenticator(
@@ -428,7 +428,7 @@ def checkin(ctx: click.Context, token: str | None) -> None:
         sys.exit(1)
 
     config = Config.from_yaml(config_path)
-    state_manager = StateManager(config.config_dir / "state.yaml", config.get_encryption_key())
+    state_manager = StateManager(config.config_dir / "state.yaml", config.get_encryption_secret())
 
     if state_manager.state.status == Status.TRIGGERED:
         click.echo("Node is already TRIGGERED. Check-in not possible.", err=True)
@@ -492,7 +492,7 @@ def status(ctx: click.Context) -> None:
         sys.exit(1)
 
     config = Config.from_yaml(config_path)
-    state_manager = StateManager(config.config_dir / "state.yaml", config.get_encryption_key())
+    state_manager = StateManager(config.config_dir / "state.yaml", config.get_encryption_secret())
     watchdog = Watchdog(config, state_manager)
 
     state = state_manager.state
@@ -538,7 +538,7 @@ def reset(ctx: click.Context, force: bool) -> None:
         sys.exit(1)
 
     config = Config.from_yaml(config_path)
-    state_manager = StateManager(config.config_dir / "state.yaml", config.get_encryption_key())
+    state_manager = StateManager(config.config_dir / "state.yaml", config.get_encryption_secret())
     current = state_manager.state.status
 
     if current == Status.ARMED:
@@ -577,7 +577,7 @@ def peers(ctx: click.Context) -> None:
         click.echo("No peers configured.")
         return
 
-    state_manager = StateManager(config.config_dir / "state.yaml", config.get_encryption_key())
+    state_manager = StateManager(config.config_dir / "state.yaml", config.get_encryption_secret())
     peer_manager = PeerManager(config, state_manager)
 
     async def check_peers():
@@ -680,7 +680,7 @@ def export(ctx: click.Context, output: Path, decrypt: bool) -> None:
         sys.exit(1)
 
     config = Config.from_yaml(config_path)
-    state_manager = StateManager(config.config_dir / "state.yaml", config.get_encryption_key())
+    state_manager = StateManager(config.config_dir / "state.yaml", config.get_encryption_secret())
 
     data = {
         'config': config.to_dict(),
@@ -689,6 +689,7 @@ def export(ctx: click.Context, output: Path, decrypt: bool) -> None:
 
     with open(output, 'w') as f:
         yaml.dump(data, f, default_flow_style=False)
+    os.chmod(output, 0o600)
 
     if config.encrypt_at_rest:
         click.echo(f"Exported to {output} (decrypted)")
@@ -728,7 +729,8 @@ def import_state(ctx: click.Context, input_file: Path) -> None:
 
     # Restore state
     state = State.from_dict(data['state'])
-    state.save(config.config_dir / "state.yaml")
+    state_path = config.config_dir / "state.yaml"
+    state.save(state_path, encryption_secret=config.get_encryption_secret())
 
     click.echo(f"State restored. Status: {state.status.value}")
 

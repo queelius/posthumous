@@ -358,11 +358,17 @@ class PeerManager:
                                 # TODO: Send notification about peer being down
 
                 self.state_manager.save()
-
+                await asyncio.sleep(check_interval)
+            except asyncio.CancelledError:
+                logger.debug("Health check loop cancelled")
+                break
             except Exception as e:
                 logger.exception(f"Error in health check: {e}")
-
-            await asyncio.sleep(check_interval)
+                try:
+                    await asyncio.sleep(check_interval)
+                except asyncio.CancelledError:
+                    logger.debug("Health check loop cancelled during error backoff")
+                    break
 
     def start_health_monitoring(self) -> None:
         """Start background health monitoring of peers."""

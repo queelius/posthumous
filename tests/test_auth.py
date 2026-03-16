@@ -160,6 +160,21 @@ class TestAuthenticator:
         # Note: failures are cleared by state.record_checkin(), not by Authenticator
         # This tests that successful auth works even with prior failures
 
+    def test_api_token_success_clears_failed_attempts(self):
+        auth = Authenticator(secret="JBSWY3DPEHPK3PXP", api_token="valid-token")
+        state = State()
+
+        # Burn 4 attempts
+        for _ in range(4):
+            auth.verify(code="000000", state=state, source="test")
+        assert len(state.failed_attempts) == 4
+
+        # Succeed via API token
+        result = auth.verify(token="valid-token", state=state, source="test")
+        assert result is True
+        assert len(state.failed_attempts) == 0
+        assert state.lockout_until is None
+
     def test_get_current_code(self):
         secret = generate_secret()
         auth = Authenticator(secret)

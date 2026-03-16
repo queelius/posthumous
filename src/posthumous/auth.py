@@ -212,6 +212,10 @@ class Authenticator:
             state.record_failed_attempt(source)
             state.check_and_set_lockout(self.max_attempts, self.lockout_duration)
 
+        if success and state:
+            state.failed_attempts = []
+            state.lockout_until = None
+
         return success
 
     def get_current_code(self) -> str:

@@ -93,10 +93,10 @@ class State:
         return config_dir / "state.yaml"
 
     @classmethod
-    def load(cls, path: Path | str, encryption_key: bytes | None = None) -> State:
+    def load(cls, path: Path | str, encryption_secret: str | None = None) -> State:
         """Load state from a YAML file.
 
-        If encryption_key is provided, transparently decrypts encrypted files.
+        If encryption_secret is provided, transparently decrypts encrypted files.
         Plaintext files are read normally (migration support).
         """
         path = Path(path)
@@ -105,9 +105,9 @@ class State:
             return cls()
 
         try:
-            if encryption_key:
+            if encryption_secret:
                 from posthumous.crypto import decrypt_file
-                content = decrypt_file(path, encryption_key)
+                content = decrypt_file(path, encryption_secret)
             else:
                 content = path.read_text()
             data = yaml.safe_load(content) or {}
@@ -204,11 +204,11 @@ class State:
             'last_modified': format_datetime(datetime.now(timezone.utc)),
         }
 
-    def save(self, path: Path | str, encryption_key: bytes | None = None) -> None:
+    def save(self, path: Path | str, encryption_secret: str | None = None) -> None:
         """Save state atomically to a YAML file.
 
         Uses write-to-temp-file + rename pattern for atomicity.
-        If encryption_key is provided, encrypts the content before writing.
+        If encryption_secret is provided, encrypts the content before writing.
         """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -217,9 +217,9 @@ class State:
         data = self.to_dict()
         content = yaml.dump(data, default_flow_style=False, sort_keys=False)
 
-        if encryption_key:
+        if encryption_secret:
             from posthumous.crypto import save_encrypted
-            save_encrypted(path, content, encryption_key)
+            save_encrypted(path, content, encryption_secret)
         else:
             # Write to temp file in same directory (for atomic rename)
             fd, temp_path = tempfile.mkstemp(
@@ -232,6 +232,7 @@ class State:
                     f.write(content)
                 # Atomic rename
                 os.replace(temp_path, path)
+                os.chmod(path, 0o600)
             except Exception:
                 # Clean up temp file on error
                 try:
@@ -248,8 +249,13 @@ class State:
         self.failed_attempts = []
         self.lockout_until = None
 
-    def transition_to(self, new_status: Status) -> bool:
+    def transition_to(self, new_status: Status, trigger_time: datetime | None = None) -> bool:
         """Transition to a new status if valid.
+
+        Args:
+            new_status: The target status.
+            trigger_time: Optional explicit trigger timestamp (e.g. from a peer).
+                          Used only for TRIGGERED transitions. Defaults to now().
 
         Returns True if transition occurred, False if no change needed.
         """
@@ -272,7 +278,7 @@ class State:
         if new_status in valid_transitions.get(self.status, set()):
             self.status = new_status
             if new_status == Status.TRIGGERED:
-                self.trigger_time = datetime.now(timezone.utc)
+                self.trigger_time = trigger_time or datetime.now(timezone.utc)
             return True
 
         return False
@@ -347,9 +353,9 @@ class StateCorruptError(Exception):
 class StateManager:
     """Manages state persistence with automatic saving."""
 
-    def __init__(self, path: Path | str, encryption_key: bytes | None = None):
+    def __init__(self, path: Path | str, encryption_secret: str | None = None):
         self.path = Path(path)
-        self.encryption_key = encryption_key
+        self.encryption_secret = encryption_secret
         self._state: State | None = None
 
     @property
@@ -357,7 +363,7 @@ class StateManager:
         """Get the current state, loading if necessary."""
         if self._state is None:
             try:
-                self._state = State.load(self.path, self.encryption_key)
+                self._state = State.load(self.path, self.encryption_secret)
             except StateCorruptError:
                 self._state = State()
         return self._state
@@ -365,16 +371,16 @@ class StateManager:
     def save(self) -> None:
         """Save the current state."""
         if self._state is not None:
-            self._state.save(self.path, self.encryption_key)
+            self._state.save(self.path, self.encryption_secret)
 
     def checkin(self, timestamp: datetime | None = None) -> None:
         """Record a check-in and save state."""
         self.state.record_checkin(timestamp)
         self.save()
 
-    def transition(self, new_status: Status) -> bool:
+    def transition(self, new_status: Status, trigger_time: datetime | None = None) -> bool:
         """Transition to new status and save if changed."""
-        changed = self.state.transition_to(new_status)
+        changed = self.state.transition_to(new_status, trigger_time=trigger_time)
         if changed:
             self.save()
         return changed

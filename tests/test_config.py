@@ -60,7 +60,7 @@ class TestConfigFromDict:
 
         assert config.node_name == "test-node"
         assert config.secret_key == "JBSWY3DPEHPK3PXP"
-        assert config.listen == "0.0.0.0:8420"
+        assert config.listen == "127.0.0.1:8420"
         assert config.checkin_interval == timedelta(days=7)
 
     def test_full_config(self):
@@ -116,6 +116,10 @@ class TestConfigFromDict:
 
         with pytest.raises(ValueError, match="secret_key"):
             Config.from_dict({"node_name": "test"})
+
+    def test_default_listen_is_localhost(self):
+        config = Config(node_name="test", secret_key="JBSWY3DPEHPK3PXP")
+        assert config.listen == "127.0.0.1:8420"
 
 
 class TestConfigYaml:
@@ -426,25 +430,26 @@ class TestConfigEncryption:
         data = config.to_dict()
         assert 'encrypt_at_rest' not in data
 
-    def test_get_encryption_key_enabled(self):
-        """get_encryption_key should return a key when encryption is enabled."""
+    def test_get_encryption_secret_enabled(self):
+        """get_encryption_secret should return the secret_key when encryption is enabled."""
         config = Config(
             node_name="test",
             secret_key="JBSWY3DPEHPK3PXP",
             encrypt_at_rest=True,
         )
-        key = config.get_encryption_key()
-        assert key is not None
-        assert isinstance(key, bytes)
+        secret = config.get_encryption_secret()
+        assert secret is not None
+        assert isinstance(secret, str)
+        assert secret == "JBSWY3DPEHPK3PXP"
 
-    def test_get_encryption_key_disabled(self):
-        """get_encryption_key should return None when encryption is disabled."""
+    def test_get_encryption_secret_disabled(self):
+        """get_encryption_secret should return None when encryption is disabled."""
         config = Config(
             node_name="test",
             secret_key="JBSWY3DPEHPK3PXP",
             encrypt_at_rest=False,
         )
-        assert config.get_encryption_key() is None
+        assert config.get_encryption_secret() is None
 
 
 class TestConfigSaveExceptionHandling:
@@ -654,3 +659,15 @@ class TestParseActionsEdgeCases:
         }
         config = Config.from_dict(data)
         assert len(config.on_warning) == 1
+
+
+class TestConfigFilePermissions:
+    """Tests for restrictive file permissions on saved config files."""
+
+    def test_config_save_sets_restrictive_permissions(self, tmp_path):
+        import stat
+        config = Config(node_name="test", secret_key="JBSWY3DPEHPK3PXP")
+        path = tmp_path / "config.yaml"
+        config.save(path)
+        mode = stat.S_IMODE(path.stat().st_mode)
+        assert mode == 0o600

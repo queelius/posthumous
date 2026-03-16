@@ -1008,6 +1008,45 @@ class TestPeerHealthMonitoring:
 
         await manager.close()
 
+    @pytest.mark.asyncio
+    async def test_health_check_loop_handles_cancellation_cleanly(self, config, state_manager):
+        """Health check loop should handle CancelledError without propagating."""
+        import asyncio as aio
+
+        manager = PeerManager(config, state_manager)
+        config.peer_check_interval = timedelta(seconds=0.05)
+
+        # Mock to avoid real network calls
+        manager.get_all_peer_status = AsyncMock(return_value=[])
+
+        manager.start_health_monitoring()
+        await aio.sleep(0.1)
+        await manager.stop_health_monitoring()
+        # Should complete without unhandled CancelledError
+
+        await manager.close()
+
+    @pytest.mark.asyncio
+    async def test_health_check_loop_cancelled_during_error_backoff(self, config, state_manager):
+        """CancelledError during the error-backoff sleep should also be handled."""
+        import asyncio as aio
+
+        manager = PeerManager(config, state_manager)
+        config.peer_check_interval = timedelta(seconds=60)  # Long interval
+
+        # Make get_all_peer_status always raise so we enter the error branch
+        async def always_fail():
+            raise RuntimeError("network down")
+
+        manager.get_all_peer_status = always_fail
+
+        manager.start_health_monitoring()
+        await aio.sleep(0.05)  # Let the loop enter error handling
+        await manager.stop_health_monitoring()
+        # Should complete without unhandled CancelledError
+
+        await manager.close()
+
 
 class TestPeerEdgeCases:
     """Edge-case tests for uncovered PeerManager paths."""

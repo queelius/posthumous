@@ -402,6 +402,19 @@ class TestExport:
         assert "state" in data
         assert data["config"]["node_name"] == "test-node"
 
+    def test_export_sets_restrictive_permissions(self, runner, valid_config_dir, config_path, tmp_path):
+        import stat
+        output_path = tmp_path / "backup.yaml"
+
+        result = runner.invoke(
+            main, ['-c', str(config_path), 'export', str(output_path)],
+        )
+
+        assert result.exit_code == 0
+        assert output_path.exists()
+        mode = stat.S_IMODE(output_path.stat().st_mode)
+        assert mode == 0o600
+
     def test_no_config(self, runner, tmp_path):
         config_path = tmp_path / "missing.yaml"
         output_path = tmp_path / "backup.yaml"
@@ -875,6 +888,51 @@ class TestExportEncryption:
 
         assert result.exit_code == 0
         assert "(decrypted)" in result.output
+
+
+class TestImportEncryption:
+    """Tests for import with encrypt_at_rest."""
+
+    def test_import_respects_encrypt_at_rest(self, runner, tmp_path):
+        """Import should produce encrypted state when encrypt_at_rest is enabled."""
+        from posthumous.crypto import is_encrypted
+
+        # Create config with encryption enabled
+        config_dir = tmp_path / ".posthumous"
+        config_dir.mkdir()
+        (config_dir / "scripts").mkdir()
+        (config_dir / "logs").mkdir()
+
+        config_path = config_dir / "config.yaml"
+        config_path.write_text(
+            "node_name: test-node\n"
+            f"secret_key: {SECRET}\n"
+            "listen: '127.0.0.1:8420'\n"
+            "checkin_interval: 7 days\n"
+            "warning_start: 8 days\n"
+            "grace_start: 12 days\n"
+            "trigger_at: 14 days\n"
+            "encrypt_at_rest: true\n"
+        )
+
+        # Create backup file
+        backup = tmp_path / "backup.yaml"
+        backup_data = {
+            'state': {'status': 'armed'}
+        }
+        with open(backup, 'w') as f:
+            yaml.dump(backup_data, f)
+
+        # Run import
+        result = runner.invoke(
+            main, ['--config', str(config_path), 'import', str(backup)],
+        )
+        assert result.exit_code == 0, result.output
+
+        # State file should be encrypted
+        state_path = config_dir / "state.yaml"
+        assert state_path.exists()
+        assert is_encrypted(state_path.read_bytes())
 
 
 class TestReset:
