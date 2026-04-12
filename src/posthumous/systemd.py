@@ -66,7 +66,6 @@ ExecStart={python_path} -m posthumous run --config {config_path}
 WatchdogSec=30
 Restart=always
 RestartSec=5
-Environment=POSTHUMOUS_CONFIG={config_path}
 
 [Install]
 WantedBy=default.target

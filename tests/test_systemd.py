@@ -117,7 +117,8 @@ class TestGenerateUnitFile:
 
         assert "Description=Posthumous Deadman Switch (my-node)" in content
         assert "ExecStart=/usr/bin/python3 -m posthumous run --config /home/user/.posthumous/config.yaml" in content
-        assert "Environment=POSTHUMOUS_CONFIG=/home/user/.posthumous/config.yaml" in content
+        # Config is passed via --config, no environment variable needed
+        assert "POSTHUMOUS_CONFIG" not in content
 
     def test_contains_required_directives(self):
         content = generate_unit_file(

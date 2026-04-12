@@ -272,24 +272,20 @@ class PeerManager:
         tasks = [self.get_peer_status(url) for url in self.config.peers]
         return await asyncio.gather(*tasks)
 
-    async def sync_state_from_peers(self) -> bool:
+    async def sync_state_from_peers(
+        self, statuses: list[PeerStatus] | None = None
+    ) -> bool:
         """Attempt to sync state from peers.
 
         Used for recovery when local state is corrupt or missing.
+        If ``statuses`` is provided, those are used instead of querying peers
+        again (avoids a duplicate round-trip when the caller already has them).
         Returns True if sync was successful.
         """
-        statuses = await self.get_all_peer_status()
+        if statuses is None:
+            statuses = await self.get_all_peer_status()
 
-        # Find peer with most recent data
-        best_peer = None
-        best_checkin = None
-
-        for status in statuses:
-            if status.reachable and status.last_checkin:
-                if best_checkin is None or status.last_checkin > best_checkin:
-                    best_peer = status
-                    best_checkin = status.last_checkin
-
+        best_peer = pick_best_peer(statuses)
         if best_peer is None:
             logger.warning("No peers available for state sync")
             return False
@@ -415,6 +411,18 @@ class PeerManager:
                 pass
             self._health_task = None
         logger.info("Peer health monitoring stopped")
+
+
+def pick_best_peer(statuses: list[PeerStatus]) -> PeerStatus | None:
+    """Return the peer with the most recent last_checkin, or None.
+
+    Used both for state recovery (corrupt local state) and for CLI preview
+    in the ``recover`` command.
+    """
+    candidates = [s for s in statuses if s.reachable and s.last_checkin]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda s: s.last_checkin)
 
 
 def format_peer_status(status: PeerStatus) -> str:

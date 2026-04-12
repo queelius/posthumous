@@ -305,7 +305,10 @@ class Server:
 
         Returns None if valid, or an error string if invalid.
         """
-        msg_time = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+        try:
+            msg_time = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+        except (ValueError, AttributeError):
+            return "Malformed timestamp"
         if abs((datetime.now(timezone.utc) - msg_time).total_seconds()) > self.SYNC_FRESHNESS_SECONDS:
             return "Stale timestamp"
 
@@ -610,8 +613,11 @@ class Server:
             logger.warning(f"Sync checkin rejected: {error}")
             return web.json_response({'error': error}, status=401)
 
-        # Process check-in
-        checkin_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+        # Process check-in (defense in depth; _verify_sync_message already parsed it)
+        try:
+            checkin_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+        except (ValueError, AttributeError):
+            return web.json_response({'error': 'Malformed timestamp'}, status=400)
         self.watchdog.checkin(checkin_time)
         logger.info(f"Processed sync checkin from peer")
 
@@ -635,9 +641,12 @@ class Server:
             logger.warning(f"Sync trigger rejected: {error}")
             return web.json_response({'error': error}, status=401)
 
-        # Mark as triggered with the peer's timestamp
+        # Mark as triggered with the peer's timestamp (defense in depth)
         from posthumous.state import Status
-        peer_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+        try:
+            peer_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+        except (ValueError, AttributeError):
+            return web.json_response({'error': 'Malformed timestamp'}, status=400)
         self.state_manager.transition(Status.TRIGGERED, trigger_time=peer_time)
         logger.info("Received trigger broadcast from peer")
 

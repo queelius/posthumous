@@ -10,10 +10,14 @@ import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import click
 
 from posthumous import __version__
+
+if TYPE_CHECKING:
+    from posthumous.config import Config
 
 
 def setup_logging(verbose: bool = False, log_file: Path | None = None) -> None:
@@ -60,6 +64,23 @@ def _resolve_config_path(ctx: click.Context) -> Path:
     return ctx.obj.get('config_path') or Config.get_default_config_path()
 
 
+def _load_config_or_exit(ctx: click.Context, hint_init: bool = False) -> tuple[Path, Config]:
+    """Resolve the config path, exit 1 if missing, else return (path, Config).
+
+    If ``hint_init`` is True, a follow-up "Run 'posthumous init' first."
+    hint is printed before exiting.
+    """
+    from posthumous.config import Config
+
+    config_path = _resolve_config_path(ctx)
+    if not config_path.exists():
+        click.echo(f"Config not found at {config_path}", err=True)
+        if hint_init:
+            click.echo("Run 'posthumous init' first.", err=True)
+        sys.exit(1)
+    return config_path, Config.from_yaml(config_path)
+
+
 def _redact_secret(secret: str) -> str:
     """Redact a secret key, showing only the first 4 characters."""
     if len(secret) <= 4:
@@ -98,15 +119,8 @@ def path(ctx: click.Context) -> None:
 def show(ctx: click.Context) -> None:
     """Print current config with secret_key redacted."""
     import yaml
-    from posthumous.config import Config
 
-    config_path = _resolve_config_path(ctx)
-
-    if not config_path.exists():
-        click.echo(f"Config not found at {config_path}", err=True)
-        sys.exit(1)
-
-    cfg = Config.from_yaml(config_path)
+    _, cfg = _load_config_or_exit(ctx)
     data = cfg.to_dict()
     data['secret_key'] = _redact_secret(data.get('secret_key', ''))
 
@@ -117,15 +131,7 @@ def show(ctx: click.Context) -> None:
 @click.pass_context
 def validate(ctx: click.Context) -> None:
     """Validate configuration and report errors."""
-    from posthumous.config import Config
-
-    config_path = _resolve_config_path(ctx)
-
-    if not config_path.exists():
-        click.echo(f"Config not found at {config_path}", err=True)
-        sys.exit(1)
-
-    cfg = Config.from_yaml(config_path)
+    _, cfg = _load_config_or_exit(ctx)
     errors = cfg.validate()
 
     if errors:
@@ -143,12 +149,7 @@ def edit(ctx: click.Context) -> None:
     """Open config in $EDITOR, then validate on close."""
     from posthumous.config import Config
 
-    config_path = _resolve_config_path(ctx)
-
-    if not config_path.exists():
-        click.echo(f"Config not found at {config_path}", err=True)
-        click.echo("Run 'posthumous init' first.", err=True)
-        sys.exit(1)
+    config_path, _ = _load_config_or_exit(ctx, hint_init=True)
 
     editor = os.environ.get('VISUAL') or os.environ.get('EDITOR') or 'vi'
     subprocess.call([editor, str(config_path)])
@@ -177,15 +178,9 @@ def service():
 @click.pass_context
 def install(ctx: click.Context) -> None:
     """Install and start the systemd user service."""
-    from posthumous.config import Config
     from posthumous.systemd import generate_unit_file, get_unit_path
 
-    config_path = _resolve_config_path(ctx)
-    if not config_path.exists():
-        click.echo(f"Config not found at {config_path}", err=True)
-        sys.exit(1)
-
-    config = Config.from_yaml(config_path)
+    config_path, config = _load_config_or_exit(ctx)
     unit_content = generate_unit_file(
         python_path=sys.executable,
         config_path=str(config_path.resolve()),
@@ -314,7 +309,6 @@ def init(ctx: click.Context, node_name: str, join_url: str | None) -> None:
 @click.pass_context
 def run(ctx: click.Context, daemon: bool, stop: bool) -> None:
     """Start the Posthumous daemon."""
-    from posthumous.config import Config
     from posthumous.state import StateManager
     from posthumous.watchdog import Watchdog
     from posthumous.auth import Authenticator
@@ -324,15 +318,7 @@ def run(ctx: click.Context, daemon: bool, stop: bool) -> None:
     from posthumous.server import Server
     from posthumous.peers import PeerManager
 
-    config_path = ctx.obj.get('config_path') or Config.get_default_config_path()
-
-    if not config_path.exists():
-        click.echo(f"Config not found at {config_path}", err=True)
-        click.echo("Run 'posthumous init' first.", err=True)
-        sys.exit(1)
-
-    # Load config
-    config = Config.from_yaml(config_path)
+    _, config = _load_config_or_exit(ctx, hint_init=True)
 
     # Handle --stop before validation (just need config_dir for PID file)
     if stop:
@@ -341,8 +327,21 @@ def run(ctx: click.Context, daemon: bool, stop: bool) -> None:
         if not pid_path.exists():
             click.echo("No PID file found. Is the daemon running?", err=True)
             sys.exit(1)
-        pid = int(pid_path.read_text().strip())
-        os.kill(pid, signal.SIGTERM)
+
+        try:
+            pid = int(pid_path.read_text().strip())
+        except ValueError:
+            click.echo(f"PID file at {pid_path} is corrupt, removing it.", err=True)
+            pid_path.unlink(missing_ok=True)
+            sys.exit(1)
+
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            click.echo(f"No process with PID {pid}. Removing stale PID file.")
+            pid_path.unlink(missing_ok=True)
+            return
+
         click.echo(f"Sent SIGTERM to PID {pid}")
         for _ in range(20):
             try:
@@ -447,13 +446,18 @@ def run(ctx: click.Context, daemon: bool, stop: bool) -> None:
                 await script_runner.run(action.script, script_context)
 
     async def on_peer_down(peer_url: str, downtime: timedelta, last_seen: datetime):
-        from posthumous.server import _format_duration
+        # Format downtime inline so we don't reach into server.py's private
+        # helper. The format here is simple ("3h 12m" / "12m") and only used
+        # for this notification context.
+        hours = int(downtime.total_seconds() // 3600)
+        minutes = int((downtime.total_seconds() % 3600) // 60)
+        downtime_str = f"{hours}h {minutes}m" if hours else f"{minutes}m"
         await execute_actions(
             "peer_down", state_manager.state.status.value,
             "Posthumous - Peer Down", config.on_peer_down,
             extra_context={
                 'peer_url': peer_url,
-                'peer_downtime': _format_duration(downtime),
+                'peer_downtime': downtime_str,
                 'peer_last_seen': last_seen.isoformat() if last_seen else 'unknown',
             },
         )
@@ -553,12 +557,17 @@ def run(ctx: click.Context, daemon: bool, stop: bool) -> None:
         await watchdog.stop()
         await server.stop()
         await peer_manager.close()
+
+        # Clean up PID file if it exists (daemon mode)
+        pid_path = config.config_dir / "posthumous.pid"
+        pid_path.unlink(missing_ok=True)
+
         logger.info("Shutdown complete")
 
     if daemon:
         from posthumous.systemd import is_service_installed
         if is_service_installed():
-            click.echo("Systemd service is installed. Use 'phm service start' instead.")
+            click.echo("Systemd service is installed. Use 'systemctl --user start posthumous' instead.")
             sys.exit(0)
 
         # Double-fork daemonization
@@ -569,6 +578,11 @@ def run(ctx: click.Context, daemon: bool, stop: bool) -> None:
         pid = os.fork()
         if pid > 0:
             sys.exit(0)
+
+        # Detach from parent's cwd (so we don't pin an unmount) and set a
+        # restrictive umask so daemon-created files aren't world-readable.
+        os.chdir("/")
+        os.umask(0o077)
 
         # Redirect stdio
         devnull = os.open(os.devnull, os.O_RDWR)
@@ -597,17 +611,10 @@ def run(ctx: click.Context, daemon: bool, stop: bool) -> None:
 @click.pass_context
 def checkin(ctx: click.Context, token: str | None) -> None:
     """Check in to reset the timer."""
-    from posthumous.config import Config
     from posthumous.state import StateManager, Status
     from posthumous.auth import Authenticator, LockedOutError, AuthError
 
-    config_path = ctx.obj.get('config_path') or Config.get_default_config_path()
-
-    if not config_path.exists():
-        click.echo(f"Config not found at {config_path}", err=True)
-        sys.exit(1)
-
-    config = Config.from_yaml(config_path)
+    _, config = _load_config_or_exit(ctx)
     state_manager = StateManager(config.config_dir / "state.yaml", config.get_encryption_secret())
 
     if state_manager.state.status == Status.TRIGGERED:
@@ -661,17 +668,10 @@ def checkin(ctx: click.Context, token: str | None) -> None:
 @click.pass_context
 def status(ctx: click.Context) -> None:
     """Show current status."""
-    from posthumous.config import Config
     from posthumous.state import StateManager
     from posthumous.watchdog import Watchdog, format_time_remaining
 
-    config_path = ctx.obj.get('config_path') or Config.get_default_config_path()
-
-    if not config_path.exists():
-        click.echo(f"Config not found at {config_path}", err=True)
-        sys.exit(1)
-
-    config = Config.from_yaml(config_path)
+    _, config = _load_config_or_exit(ctx)
     state_manager = StateManager(config.config_dir / "state.yaml", config.get_encryption_secret())
     watchdog = Watchdog(config, state_manager)
 
@@ -708,16 +708,9 @@ def status(ctx: click.Context) -> None:
 @click.pass_context
 def reset(ctx: click.Context, force: bool) -> None:
     """Reset state to ARMED (administrative recovery)."""
-    from posthumous.config import Config
     from posthumous.state import StateManager, Status
 
-    config_path = ctx.obj.get('config_path') or Config.get_default_config_path()
-
-    if not config_path.exists():
-        click.echo(f"Config not found at {config_path}", err=True)
-        sys.exit(1)
-
-    config = Config.from_yaml(config_path)
+    _, config = _load_config_or_exit(ctx)
     state_manager = StateManager(config.config_dir / "state.yaml", config.get_encryption_secret())
     current = state_manager.state.status
 
@@ -742,21 +735,19 @@ def reset(ctx: click.Context, force: bool) -> None:
 @click.pass_context
 def recover(ctx: click.Context, force: bool) -> None:
     """Recover state from the healthiest peer."""
-    from posthumous.config import Config
     from posthumous.state import StateManager
-    from posthumous.peers import PeerManager
+    from posthumous.peers import PeerManager, pick_best_peer
 
-    config_path = _resolve_config_path(ctx)
-    if not config_path.exists():
-        click.echo(f"Config not found at {config_path}", err=True)
-        sys.exit(1)
-
-    config = Config.from_yaml(config_path)
+    _, config = _load_config_or_exit(ctx)
     state_manager = StateManager(config.config_dir / "state.yaml", config.get_encryption_secret())
 
     async def do_recover():
         peer_manager = PeerManager(config, state_manager)
         try:
+            # Fetch peer statuses once; pass them through to sync_state_from_peers
+            # below so we don't issue a second round of requests.
+            statuses = await peer_manager.get_all_peer_status()
+
             if not force:
                 # Show local state
                 local = state_manager.state
@@ -766,12 +757,7 @@ def recover(ctx: click.Context, force: bool) -> None:
                 click.echo(f"  trigger_time: {local.trigger_time or 'none'}")
                 click.echo(f"  schedule:     {len(local.schedule_state)} items")
 
-                # Fetch peer state for comparison
-                statuses = await peer_manager.get_all_peer_status()
-                best = max(
-                    (s for s in statuses if s.reachable and s.last_checkin),
-                    key=lambda s: s.last_checkin, default=None,
-                )
+                best = pick_best_peer(statuses)
                 if best:
                     click.echo(f"\nPeer state ({best.url}):")
                     click.echo(f"  status:       {best.status or 'unknown'}")
@@ -785,7 +771,7 @@ def recover(ctx: click.Context, force: bool) -> None:
                     click.echo("Aborted.")
                     return
 
-            success = await peer_manager.sync_state_from_peers()
+            success = await peer_manager.sync_state_from_peers(statuses)
             if success:
                 click.echo("State recovered from peer successfully.")
             else:
@@ -801,17 +787,10 @@ def recover(ctx: click.Context, force: bool) -> None:
 @click.pass_context
 def peers(ctx: click.Context) -> None:
     """Show peer status."""
-    from posthumous.config import Config
     from posthumous.state import StateManager
     from posthumous.peers import PeerManager, format_peer_status
 
-    config_path = ctx.obj.get('config_path') or Config.get_default_config_path()
-
-    if not config_path.exists():
-        click.echo(f"Config not found at {config_path}", err=True)
-        sys.exit(1)
-
-    config = Config.from_yaml(config_path)
+    _, config = _load_config_or_exit(ctx)
 
     if not config.peers:
         click.echo("No peers configured.")
@@ -836,16 +815,9 @@ def peers(ctx: click.Context) -> None:
 @click.pass_context
 def test_notify(ctx: click.Context, channel: str | None) -> None:
     """Send test notifications."""
-    from posthumous.config import Config
     from posthumous.notifications import NotificationManager
 
-    config_path = ctx.obj.get('config_path') or Config.get_default_config_path()
-
-    if not config_path.exists():
-        click.echo(f"Config not found at {config_path}", err=True)
-        sys.exit(1)
-
-    config = Config.from_yaml(config_path)
+    _, config = _load_config_or_exit(ctx)
     manager = NotificationManager(config.notifications)
 
     async def test():
@@ -869,15 +841,9 @@ def test_notify(ctx: click.Context, channel: str | None) -> None:
 @click.pass_context
 def test_trigger(ctx: click.Context) -> None:
     """Show what would happen on trigger (always dry run)."""
-    from posthumous.config import Config, NotificationAction, ScriptAction
+    from posthumous.config import NotificationAction, ScriptAction
 
-    config_path = ctx.obj.get('config_path') or Config.get_default_config_path()
-
-    if not config_path.exists():
-        click.echo(f"Config not found at {config_path}", err=True)
-        sys.exit(1)
-
-    config = Config.from_yaml(config_path)
+    _, config = _load_config_or_exit(ctx)
 
     click.echo("Trigger actions that would execute:")
     click.echo()
@@ -909,16 +875,9 @@ def export(ctx: click.Context, output: Path, decrypt: bool) -> None:
     it is transparently decrypted for the export.
     """
     import yaml
-    from posthumous.config import Config
     from posthumous.state import StateManager
 
-    config_path = ctx.obj.get('config_path') or Config.get_default_config_path()
-
-    if not config_path.exists():
-        click.echo(f"Config not found at {config_path}", err=True)
-        sys.exit(1)
-
-    config = Config.from_yaml(config_path)
+    _, config = _load_config_or_exit(ctx)
     state_manager = StateManager(config.config_dir / "state.yaml", config.get_encryption_secret())
 
     data = {
