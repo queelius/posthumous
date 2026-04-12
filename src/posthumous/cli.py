@@ -8,7 +8,7 @@ import os
 import signal
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -308,14 +308,7 @@ def init(ctx: click.Context, node_name: str, join_url: str | None) -> None:
 @click.pass_context
 def run(ctx: click.Context, daemon: bool, stop: bool) -> None:
     """Start the Posthumous daemon."""
-    from posthumous.state import StateManager
-    from posthumous.watchdog import Watchdog
-    from posthumous.auth import Authenticator
-    from posthumous.notifications import NotificationManager, build_context
-    from posthumous.scripts import ScriptRunner, ScriptContext
-    from posthumous.scheduler import Scheduler, ScheduledExecution
-    from posthumous.server import Server
-    from posthumous.peers import PeerManager
+    from posthumous.runner import DaemonRunner
 
     _, config = _load_config_or_exit(ctx, hint_init=True)
 
@@ -363,205 +356,6 @@ def run(ctx: click.Context, daemon: bool, stop: bool) -> None:
     # Setup logging
     log_file = config.config_dir / "logs" / "posthumous.log"
     setup_logging(ctx.obj.get('verbose', False), log_file)
-    logger = logging.getLogger(__name__)
-
-    # Pre-flight: check state file integrity before constructing StateManager
-    from posthumous.state import State, StateCorruptError
-    state_path = config.config_dir / "state.yaml"
-    encryption_secret = config.get_encryption_secret()
-
-    if state_path.exists():
-        try:
-            State.load(state_path, encryption_secret)
-        except StateCorruptError:
-            logger.warning("State file is corrupt, attempting peer recovery...")
-            temp_manager = StateManager(state_path, encryption_secret)
-            temp_peer = PeerManager(config, temp_manager)
-
-            async def attempt_recovery():
-                try:
-                    recovered = await temp_peer.sync_state_from_peers()
-                    if recovered:
-                        logger.info("State recovered from peer")
-                    else:
-                        logger.warning("No peers available, starting with fresh state")
-                except Exception as e:
-                    logger.warning(f"Peer recovery failed: {e}, starting with fresh state")
-                finally:
-                    await temp_peer.close()
-
-            asyncio.run(attempt_recovery())
-
-    # Initialize components
-    state_manager = StateManager(config.config_dir / "state.yaml", config.get_encryption_secret())
-    notification_manager = NotificationManager(config.notifications)
-    script_runner = ScriptRunner(config.config_dir)
-    authenticator = Authenticator(
-        secret=config.secret_key,
-        api_token=config.api_token,
-        max_attempts=config.max_failed_attempts,
-        lockout_duration=config.lockout_duration,
-    )
-
-    # Action callbacks
-    from posthumous.config import NotificationAction, ScriptAction
-
-    async def execute_actions(
-        event: str,
-        status: str,
-        title: str,
-        actions: list,
-        trigger_time: datetime | None = None,
-        extra_context: dict[str, str] | None = None,
-    ) -> None:
-        """Execute a list of notification and script actions."""
-        logger.info(f"{title} - executing actions")
-
-        context = build_context(
-            node_name=config.node_name,
-            status=status,
-            last_checkin=state_manager.state.last_checkin,
-            trigger_time=trigger_time,
-            trigger_at=config.trigger_at,
-            base_url=config.get_base_url(),
-        )
-        if extra_context:
-            context.update(extra_context)
-
-        for action in actions:
-            if isinstance(action, NotificationAction):
-                await notification_manager.send(
-                    action.channel, action.message,
-                    title=title, context=context,
-                )
-            elif isinstance(action, ScriptAction):
-                script_context = ScriptContext(
-                    event=event,
-                    trigger_time=trigger_time,
-                    node_name=config.node_name,
-                    status=status,
-                    last_checkin=state_manager.state.last_checkin,
-                )
-                await script_runner.run(action.script, script_context)
-
-    async def on_peer_down(peer_url: str, downtime: timedelta, last_seen: datetime):
-        # Format downtime inline so we don't reach into server.py's private
-        # helper. The format here is simple ("3h 12m" / "12m") and only used
-        # for this notification context.
-        hours = int(downtime.total_seconds() // 3600)
-        minutes = int((downtime.total_seconds() % 3600) // 60)
-        downtime_str = f"{hours}h {minutes}m" if hours else f"{minutes}m"
-        await execute_actions(
-            "peer_down", state_manager.state.status.value,
-            "Posthumous - Peer Down", config.on_peer_down,
-            extra_context={
-                'peer_url': peer_url,
-                'peer_downtime': downtime_str,
-                'peer_last_seen': last_seen.isoformat() if last_seen else 'unknown',
-            },
-        )
-
-    # Peer manager
-    peer_manager = PeerManager(config, state_manager, on_peer_down=on_peer_down)
-
-    async def on_warning():
-        await execute_actions("warning", "warning", "Posthumous Warning", config.on_warning)
-
-    async def on_grace():
-        await execute_actions("grace", "grace", "Posthumous - URGENT", config.on_grace)
-
-    async def on_trigger():
-        # Broadcast to peers first
-        if state_manager.state.trigger_time:
-            await peer_manager.broadcast_trigger(state_manager.state.trigger_time)
-
-        await execute_actions(
-            "trigger", "triggered", "Posthumous Activated",
-            config.on_trigger, state_manager.state.trigger_time
-        )
-
-    async def on_scheduled_complete(execution: ScheduledExecution):
-        await peer_manager.broadcast_scheduled_complete(
-            execution.item_name, execution.period_key
-        )
-
-    # Create components
-    watchdog = Watchdog(
-        config, state_manager,
-        on_warning=on_warning,
-        on_grace=on_grace,
-        on_trigger=on_trigger,
-    )
-
-    scheduler = Scheduler(
-        config, state_manager,
-        notification_manager=notification_manager,
-        script_runner=script_runner,
-        on_scheduled_complete=on_scheduled_complete,
-    )
-
-    server = Server(
-        config, state_manager, watchdog,
-        authenticator, peer_manager,
-    )
-
-    async def run_daemon():
-        # Setup signal handlers
-        loop = asyncio.get_event_loop()
-        stop_event = asyncio.Event()
-
-        def handle_signal():
-            logger.info("Shutdown signal received")
-            stop_event.set()
-
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(sig, handle_signal)
-
-        # Start components. Order matters: server must be ready before watchdog,
-        # which may fire callbacks that broadcast to peers via peer_manager.
-        await server.start()
-        peer_manager.start_health_monitoring()
-        watchdog.start()
-        scheduler.start()
-
-        from posthumous.systemd import notify_ready, notify_watchdog, notify_stopping
-        notify_ready()
-        logger.info("sd_notify: READY=1")
-
-        logger.info(f"Posthumous node '{config.node_name}' started")
-        logger.info(f"Status: {state_manager.state.status.value}")
-        logger.info(f"Web UI: http://{config.listen}/")
-
-        async def watchdog_ping():
-            while not stop_event.is_set():
-                notify_watchdog()
-                await asyncio.sleep(15)
-
-        watchdog_task = asyncio.create_task(watchdog_ping())
-
-        # Wait for shutdown
-        await stop_event.wait()
-
-        # Cleanup
-        notify_stopping()
-        watchdog_task.cancel()
-        try:
-            await watchdog_task
-        except asyncio.CancelledError:
-            pass
-
-        logger.info("Shutting down...")
-        await peer_manager.stop_health_monitoring()
-        await scheduler.stop()
-        await watchdog.stop()
-        await server.stop()
-        await peer_manager.close()
-
-        # Clean up PID file if it exists (daemon mode)
-        pid_path = config.config_dir / "posthumous.pid"
-        pid_path.unlink(missing_ok=True)
-
-        logger.info("Shutdown complete")
 
     if daemon:
         from posthumous.systemd import is_service_installed
@@ -599,8 +393,17 @@ def run(ctx: click.Context, daemon: bool, stop: bool) -> None:
         pid_path.write_text(str(os.getpid()))
 
     click.echo(f"Starting Posthumous node '{config.node_name}'...")
+
+    # Build the runner up front so state recovery (if needed) and the main
+    # daemon lifecycle use the same instance. The recovery is run in its own
+    # asyncio.run() call so that any aiohttp sessions it opened are fully
+    # torn down before the daemon loop starts.
+    runner = DaemonRunner(config)
+    asyncio.run(runner.attempt_state_recovery())
+    runner.build_components()
+
     try:
-        asyncio.run(run_daemon())
+        asyncio.run(runner.run())
     except KeyboardInterrupt:
         pass
 

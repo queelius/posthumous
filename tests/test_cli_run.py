@@ -136,10 +136,10 @@ class TestRunComponents:
         mock_scheduler = _make_mock_scheduler()
         mock_peer_mgr = _make_mock_peer_manager()
 
-        with patch('posthumous.server.Server', return_value=mock_server), \
-             patch('posthumous.watchdog.Watchdog', return_value=mock_watchdog), \
-             patch('posthumous.scheduler.Scheduler', return_value=mock_scheduler), \
-             patch('posthumous.peers.PeerManager', return_value=mock_peer_mgr), \
+        with patch('posthumous.runner.Server', return_value=mock_server), \
+             patch('posthumous.runner.Watchdog', return_value=mock_watchdog), \
+             patch('posthumous.runner.Scheduler', return_value=mock_scheduler), \
+             patch('posthumous.runner.PeerManager', return_value=mock_peer_mgr), \
              patch('asyncio.Event.wait', new_callable=AsyncMock):
             result = runner.invoke(
                 main, ['-c', str(config_path), 'run'],
@@ -180,10 +180,10 @@ class TestRunComponents:
         mock_server.stop = AsyncMock(side_effect=track_server_stop)
         mock_peer_mgr.close = AsyncMock(side_effect=track_peer_close)
 
-        with patch('posthumous.server.Server', return_value=mock_server), \
-             patch('posthumous.watchdog.Watchdog', return_value=mock_watchdog), \
-             patch('posthumous.scheduler.Scheduler', return_value=mock_scheduler), \
-             patch('posthumous.peers.PeerManager', return_value=mock_peer_mgr), \
+        with patch('posthumous.runner.Server', return_value=mock_server), \
+             patch('posthumous.runner.Watchdog', return_value=mock_watchdog), \
+             patch('posthumous.runner.Scheduler', return_value=mock_scheduler), \
+             patch('posthumous.runner.PeerManager', return_value=mock_peer_mgr), \
              patch('asyncio.Event.wait', new_callable=AsyncMock):
             result = runner.invoke(
                 main, ['-c', str(config_path), 'run'],
@@ -218,11 +218,11 @@ class TestRunComponents:
             if captured_on_warning:
                 await captured_on_warning()
 
-        with patch('posthumous.server.Server', return_value=mock_server), \
-             patch('posthumous.watchdog.Watchdog', side_effect=capture_watchdog), \
-             patch('posthumous.scheduler.Scheduler', return_value=mock_scheduler), \
-             patch('posthumous.peers.PeerManager', return_value=mock_peer_mgr), \
-             patch('posthumous.notifications.NotificationManager', return_value=mock_notif_mgr), \
+        with patch('posthumous.runner.Server', return_value=mock_server), \
+             patch('posthumous.runner.Watchdog', side_effect=capture_watchdog), \
+             patch('posthumous.runner.Scheduler', return_value=mock_scheduler), \
+             patch('posthumous.runner.PeerManager', return_value=mock_peer_mgr), \
+             patch('posthumous.runner.NotificationManager', return_value=mock_notif_mgr), \
              patch('asyncio.Event.wait', new_callable=lambda: AsyncMock(side_effect=wait_and_call_warning)):
             result = runner.invoke(
                 main, ['-c', str(config_path), 'run'],
@@ -252,12 +252,12 @@ class TestRunComponents:
             if captured_on_trigger:
                 await captured_on_trigger()
 
-        with patch('posthumous.server.Server', return_value=mock_server), \
-             patch('posthumous.watchdog.Watchdog', side_effect=capture_watchdog), \
-             patch('posthumous.scheduler.Scheduler', return_value=mock_scheduler), \
-             patch('posthumous.peers.PeerManager', return_value=mock_peer_mgr), \
-             patch('posthumous.notifications.NotificationManager', return_value=mock_notif_mgr), \
-             patch('posthumous.scripts.ScriptRunner', return_value=mock_script_runner), \
+        with patch('posthumous.runner.Server', return_value=mock_server), \
+             patch('posthumous.runner.Watchdog', side_effect=capture_watchdog), \
+             patch('posthumous.runner.Scheduler', return_value=mock_scheduler), \
+             patch('posthumous.runner.PeerManager', return_value=mock_peer_mgr), \
+             patch('posthumous.runner.NotificationManager', return_value=mock_notif_mgr), \
+             patch('posthumous.runner.ScriptRunner', return_value=mock_script_runner), \
              patch('asyncio.Event.wait', new_callable=lambda: AsyncMock(side_effect=wait_and_call_trigger)):
             result = runner.invoke(
                 main, ['-c', str(config_path), 'run'],
@@ -295,10 +295,10 @@ class TestRunComponents:
         mock_scheduler = _make_mock_scheduler()
         mock_peer_mgr = _make_mock_peer_manager()
 
-        with patch('posthumous.server.Server', return_value=mock_server), \
-             patch('posthumous.watchdog.Watchdog', return_value=mock_watchdog), \
-             patch('posthumous.scheduler.Scheduler', return_value=mock_scheduler), \
-             patch('posthumous.peers.PeerManager', return_value=mock_peer_mgr), \
+        with patch('posthumous.runner.Server', return_value=mock_server), \
+             patch('posthumous.runner.Watchdog', return_value=mock_watchdog), \
+             patch('posthumous.runner.Scheduler', return_value=mock_scheduler), \
+             patch('posthumous.runner.PeerManager', return_value=mock_peer_mgr), \
              patch('asyncio.Event.wait', new_callable=AsyncMock, side_effect=KeyboardInterrupt):
             result = runner.invoke(
                 main, ['-c', str(config_path), 'run'],
@@ -327,11 +327,11 @@ class TestRunComponents:
             if captured_on_grace:
                 await captured_on_grace()
 
-        with patch('posthumous.server.Server', return_value=mock_server), \
-             patch('posthumous.watchdog.Watchdog', side_effect=capture_watchdog), \
-             patch('posthumous.scheduler.Scheduler', return_value=mock_scheduler), \
-             patch('posthumous.peers.PeerManager', return_value=mock_peer_mgr), \
-             patch('posthumous.notifications.NotificationManager', return_value=mock_notif_mgr), \
+        with patch('posthumous.runner.Server', return_value=mock_server), \
+             patch('posthumous.runner.Watchdog', side_effect=capture_watchdog), \
+             patch('posthumous.runner.Scheduler', return_value=mock_scheduler), \
+             patch('posthumous.runner.PeerManager', return_value=mock_peer_mgr), \
+             patch('posthumous.runner.NotificationManager', return_value=mock_notif_mgr), \
              patch('asyncio.Event.wait', new_callable=lambda: AsyncMock(side_effect=wait_and_call_grace)):
             result = runner.invoke(
                 main, ['-c', str(config_path), 'run'],
@@ -373,12 +373,12 @@ class TestRunComponents:
             "last_checkin": datetime(2026, 1, 10, 8, 0, 0, tzinfo=timezone.utc).isoformat(),
         }))
 
-        with patch('posthumous.server.Server', return_value=mock_server), \
-             patch('posthumous.watchdog.Watchdog', side_effect=capture_watchdog), \
-             patch('posthumous.scheduler.Scheduler', return_value=mock_scheduler), \
-             patch('posthumous.peers.PeerManager', return_value=mock_peer_mgr), \
-             patch('posthumous.notifications.NotificationManager', return_value=mock_notif_mgr), \
-             patch('posthumous.scripts.ScriptRunner', return_value=mock_script_runner), \
+        with patch('posthumous.runner.Server', return_value=mock_server), \
+             patch('posthumous.runner.Watchdog', side_effect=capture_watchdog), \
+             patch('posthumous.runner.Scheduler', return_value=mock_scheduler), \
+             patch('posthumous.runner.PeerManager', return_value=mock_peer_mgr), \
+             patch('posthumous.runner.NotificationManager', return_value=mock_notif_mgr), \
+             patch('posthumous.runner.ScriptRunner', return_value=mock_script_runner), \
              patch('asyncio.Event.wait', new_callable=lambda: AsyncMock(side_effect=wait_and_call_trigger)):
             result = runner.invoke(
                 main, ['-c', str(config_path), 'run'],
@@ -413,10 +413,10 @@ class TestRunComponents:
                 )
                 await captured_on_scheduled_complete(execution)
 
-        with patch('posthumous.server.Server', return_value=mock_server), \
-             patch('posthumous.watchdog.Watchdog', return_value=mock_watchdog), \
-             patch('posthumous.scheduler.Scheduler', side_effect=capture_scheduler), \
-             patch('posthumous.peers.PeerManager', return_value=mock_peer_mgr), \
+        with patch('posthumous.runner.Server', return_value=mock_server), \
+             patch('posthumous.runner.Watchdog', return_value=mock_watchdog), \
+             patch('posthumous.runner.Scheduler', side_effect=capture_scheduler), \
+             patch('posthumous.runner.PeerManager', return_value=mock_peer_mgr), \
              patch('asyncio.Event.wait', new_callable=lambda: AsyncMock(side_effect=wait_and_call_complete)):
             result = runner.invoke(
                 main, ['-c', str(config_path), 'run'],
@@ -437,13 +437,13 @@ class TestSdNotifyIntegration:
         mock_scheduler = _make_mock_scheduler()
         mock_peer_mgr = _make_mock_peer_manager()
 
-        with patch('posthumous.server.Server', return_value=mock_server), \
-             patch('posthumous.watchdog.Watchdog', return_value=mock_watchdog), \
-             patch('posthumous.scheduler.Scheduler', return_value=mock_scheduler), \
-             patch('posthumous.peers.PeerManager', return_value=mock_peer_mgr), \
-             patch('posthumous.systemd.notify_ready') as mock_ready, \
-             patch('posthumous.systemd.notify_watchdog') as mock_wd, \
-             patch('posthumous.systemd.notify_stopping') as mock_stopping, \
+        with patch('posthumous.runner.Server', return_value=mock_server), \
+             patch('posthumous.runner.Watchdog', return_value=mock_watchdog), \
+             patch('posthumous.runner.Scheduler', return_value=mock_scheduler), \
+             patch('posthumous.runner.PeerManager', return_value=mock_peer_mgr), \
+             patch('posthumous.runner.notify_ready') as mock_ready, \
+             patch('posthumous.runner.notify_watchdog') as mock_wd, \
+             patch('posthumous.runner.notify_stopping') as mock_stopping, \
              patch('asyncio.Event.wait', new_callable=AsyncMock):
             result = runner.invoke(
                 main, ['-c', str(config_path), 'run'],
@@ -458,13 +458,13 @@ class TestSdNotifyIntegration:
         mock_scheduler = _make_mock_scheduler()
         mock_peer_mgr = _make_mock_peer_manager()
 
-        with patch('posthumous.server.Server', return_value=mock_server), \
-             patch('posthumous.watchdog.Watchdog', return_value=mock_watchdog), \
-             patch('posthumous.scheduler.Scheduler', return_value=mock_scheduler), \
-             patch('posthumous.peers.PeerManager', return_value=mock_peer_mgr), \
-             patch('posthumous.systemd.notify_ready') as mock_ready, \
-             patch('posthumous.systemd.notify_watchdog') as mock_wd, \
-             patch('posthumous.systemd.notify_stopping') as mock_stopping, \
+        with patch('posthumous.runner.Server', return_value=mock_server), \
+             patch('posthumous.runner.Watchdog', return_value=mock_watchdog), \
+             patch('posthumous.runner.Scheduler', return_value=mock_scheduler), \
+             patch('posthumous.runner.PeerManager', return_value=mock_peer_mgr), \
+             patch('posthumous.runner.notify_ready') as mock_ready, \
+             patch('posthumous.runner.notify_watchdog') as mock_wd, \
+             patch('posthumous.runner.notify_stopping') as mock_stopping, \
              patch('asyncio.Event.wait', new_callable=AsyncMock):
             result = runner.invoke(
                 main, ['-c', str(config_path), 'run'],
@@ -495,13 +495,13 @@ class TestSdNotifyIntegration:
             else:
                 await original_sleep(seconds)
 
-        with patch('posthumous.server.Server', return_value=mock_server), \
-             patch('posthumous.watchdog.Watchdog', return_value=mock_watchdog), \
-             patch('posthumous.scheduler.Scheduler', return_value=mock_scheduler), \
-             patch('posthumous.peers.PeerManager', return_value=mock_peer_mgr), \
-             patch('posthumous.systemd.notify_ready'), \
-             patch('posthumous.systemd.notify_watchdog') as mock_wd, \
-             patch('posthumous.systemd.notify_stopping'), \
+        with patch('posthumous.runner.Server', return_value=mock_server), \
+             patch('posthumous.runner.Watchdog', return_value=mock_watchdog), \
+             patch('posthumous.runner.Scheduler', return_value=mock_scheduler), \
+             patch('posthumous.runner.PeerManager', return_value=mock_peer_mgr), \
+             patch('posthumous.runner.notify_ready'), \
+             patch('posthumous.runner.notify_watchdog') as mock_wd, \
+             patch('posthumous.runner.notify_stopping'), \
              patch('asyncio.Event.wait', new_callable=lambda: AsyncMock(side_effect=slow_wait)), \
              patch('asyncio.sleep', side_effect=fast_sleep):
             result = runner.invoke(
@@ -528,10 +528,10 @@ class TestPeerDownWiring:
             captured_kwargs.update(kwargs)
             return mock_peer_mgr
 
-        with patch('posthumous.server.Server', return_value=mock_server), \
-             patch('posthumous.watchdog.Watchdog', return_value=mock_watchdog), \
-             patch('posthumous.scheduler.Scheduler', return_value=mock_scheduler), \
-             patch('posthumous.peers.PeerManager', side_effect=capture_peer_manager), \
+        with patch('posthumous.runner.Server', return_value=mock_server), \
+             patch('posthumous.runner.Watchdog', return_value=mock_watchdog), \
+             patch('posthumous.runner.Scheduler', return_value=mock_scheduler), \
+             patch('posthumous.runner.PeerManager', side_effect=capture_peer_manager), \
              patch('asyncio.Event.wait', new_callable=AsyncMock):
             result = runner.invoke(
                 main, ['-c', str(config_path), 'run'],
