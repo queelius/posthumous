@@ -1248,6 +1248,51 @@ class TestPeerDownCallback:
 
         await manager.close()
 
+    @pytest.mark.asyncio
+    async def test_alerted_at_persists_across_restart(self, config, state_manager):
+        """Once a peer is alerted, a new PeerManager must not re-alert for the same episode."""
+        peer_url = "https://peer1.local:8420"
+        now = datetime.now(timezone.utc)
+
+        # Phase 1: first daemon run — alerts once.
+        first_calls = []
+
+        async def on_first(peer, dur, seen):
+            first_calls.append(peer)
+
+        mgr1 = PeerManager(config, state_manager, on_peer_down=on_first)
+        state_manager.state.update_peer(peer_url, success=True)
+        state_manager.state.peer_states[peer_url].last_seen = now - timedelta(hours=12)
+
+        down = [PeerStatus(url=peer_url, reachable=False, status=None,
+                           last_checkin=None, last_seen=None, error="refused")]
+        mgr1.get_all_peer_status = AsyncMock(return_value=down)
+        await mgr1._health_check_once()
+        assert len(first_calls) == 1
+        assert state_manager.state.peer_states[peer_url].alerted_at is not None
+        await mgr1.close()
+
+        # Phase 2: simulate daemon restart — fresh PeerManager with empty in-memory
+        # alerted set, but state.yaml still says alerted_at is set. No repeat alert.
+        second_calls = []
+
+        async def on_second(peer, dur, seen):
+            second_calls.append(peer)
+
+        mgr2 = PeerManager(config, state_manager, on_peer_down=on_second)
+        assert mgr2._alerted_peers == set()
+        mgr2.get_all_peer_status = AsyncMock(return_value=down)
+        await mgr2._health_check_once()
+        assert len(second_calls) == 0, "should not re-alert after restart"
+        await mgr2.close()
+
+        # Phase 3: peer recovers, alerted_at clears, next downtime alerts again.
+        up = [PeerStatus(url=peer_url, reachable=True, status="armed",
+                         last_checkin=now, last_seen=now)]
+        mgr2.get_all_peer_status = AsyncMock(return_value=up)
+        await mgr2._health_check_once()
+        assert state_manager.state.peer_states[peer_url].alerted_at is None
+
 
 class TestPeerEdgeCases:
     """Edge-case tests for uncovered PeerManager paths."""

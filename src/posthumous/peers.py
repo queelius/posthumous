@@ -349,20 +349,31 @@ class PeerManager:
                 self.state_manager.state.update_peer(
                     status.url, success=True
                 )
+                # Clear the alert guard now that the peer is healthy again.
                 self._alerted_peers.discard(status.url)
+                refreshed = self.state_manager.state.peer_states.get(status.url)
+                if refreshed and refreshed.alerted_at is not None:
+                    refreshed.alerted_at = None
             else:
                 self.state_manager.state.update_peer(
                     status.url, success=False, error=status.error
                 )
 
-                # Check if we should alert (once per down episode)
+                # Check if we should alert (once per down episode). The guard
+                # is persisted via PeerState.alerted_at so it survives daemon
+                # restarts; the in-memory set is kept for intra-run speed.
                 if peer_state and peer_state.last_seen:
                     down_duration = now - peer_state.last_seen
-                    if down_duration >= down_threshold and status.url not in self._alerted_peers:
+                    already_alerted = (
+                        status.url in self._alerted_peers
+                        or peer_state.alerted_at is not None
+                    )
+                    if down_duration >= down_threshold and not already_alerted:
                         logger.warning(
                             f"Peer {status.url} has been unreachable for {down_duration}"
                         )
                         self._alerted_peers.add(status.url)
+                        peer_state.alerted_at = now
                         if self._on_peer_down:
                             await self._on_peer_down(
                                 status.url,

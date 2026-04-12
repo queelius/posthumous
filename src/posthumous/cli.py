@@ -193,8 +193,7 @@ def install(ctx: click.Context) -> None:
     click.echo(f"Unit file written to {unit_path}")
 
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
-    subprocess.run(["systemctl", "--user", "enable", "posthumous"], check=True)
-    subprocess.run(["systemctl", "--user", "start", "posthumous"], check=True)
+    subprocess.run(["systemctl", "--user", "enable", "--now", "posthumous"], check=True)
     click.echo("Service installed, enabled, and started.")
 
 

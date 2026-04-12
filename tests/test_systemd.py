@@ -155,14 +155,22 @@ class TestGenerateUnitFile:
         )
         assert "node-with-dashes_and_underscores" in content
 
-    def test_paths_with_spaces(self):
-        content = generate_unit_file(
-            python_path="/opt/my apps/python3",
-            config_path="/home/user/my config/config.yaml",
-            node_name="test",
-        )
-        assert "/opt/my apps/python3" in content
-        assert "/home/user/my config/config.yaml" in content
+    def test_python_path_with_spaces_raises(self):
+        """systemd's ExecStart does not support whitespace in paths — reject, don't silently produce broken unit files."""
+        with pytest.raises(ValueError, match="python_path contains whitespace"):
+            generate_unit_file(
+                python_path="/opt/my apps/python3",
+                config_path="/home/user/.posthumous/config.yaml",
+                node_name="test",
+            )
+
+    def test_config_path_with_spaces_raises(self):
+        with pytest.raises(ValueError, match="config_path contains whitespace"):
+            generate_unit_file(
+                python_path="/usr/bin/python3",
+                config_path="/home/user/my config/config.yaml",
+                node_name="test",
+            )
 
 
 class TestGetUnitPath:

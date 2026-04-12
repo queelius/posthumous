@@ -1092,8 +1092,7 @@ class TestServiceInstall:
 
         assert result.exit_code == 0, result.output
         assert ["systemctl", "--user", "daemon-reload"] in calls
-        assert ["systemctl", "--user", "enable", "posthumous"] in calls
-        assert ["systemctl", "--user", "start", "posthumous"] in calls
+        assert ["systemctl", "--user", "enable", "--now", "posthumous"] in calls
 
     def test_install_no_config(self, runner, tmp_path):
         """install with missing config should exit 1."""

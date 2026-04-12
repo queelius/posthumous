@@ -83,7 +83,20 @@ def is_service_installed() -> bool:
 
 
 def generate_unit_file(python_path: str, config_path: str, node_name: str) -> str:
-    """Generate a systemd unit file with the given parameters."""
+    """Generate a systemd unit file with the given parameters.
+
+    Raises:
+        ValueError: if any path contains whitespace. systemd's unit-file
+            parser does not support shell-style quoting in ExecStart, so paths
+            with spaces would be split into bogus argv entries.
+    """
+    for label, value in (("python_path", python_path), ("config_path", config_path)):
+        if any(c.isspace() for c in value):
+            raise ValueError(
+                f"{label} contains whitespace ({value!r}); systemd unit files "
+                f"do not support spaces in ExecStart paths. Move the file or "
+                f"use a symlink without spaces."
+            )
     return UNIT_TEMPLATE.format(
         python_path=python_path,
         config_path=config_path,

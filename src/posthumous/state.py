@@ -60,6 +60,10 @@ class PeerState:
     last_seen: datetime | None = None
     last_error: str | None = None
     consecutive_failures: int = 0
+    # Timestamp of the most recent "peer down" alert. Persisted so the
+    # guard against repeat-alerting survives daemon restarts. Cleared
+    # automatically once `last_seen` moves forward past it.
+    alerted_at: datetime | None = None
 
 
 @dataclass
@@ -147,6 +151,7 @@ class State:
                     last_seen=parse_datetime(peer_data.get('last_seen')),
                     last_error=peer_data.get('last_error'),
                     consecutive_failures=peer_data.get('consecutive_failures', 0),
+                    alerted_at=parse_datetime(peer_data.get('alerted_at')),
                 )
 
         status_str = data.get('status', 'armed')
@@ -190,6 +195,7 @@ class State:
                 'last_seen': format_datetime(peer.last_seen),
                 'last_error': peer.last_error,
                 'consecutive_failures': peer.consecutive_failures,
+                'alerted_at': format_datetime(peer.alerted_at),
             }
 
         return {
