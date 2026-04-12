@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "posthumous"
-version = "0.1.0"
+version = "0.6.0"
 description = "A lightweight, federated deadman switch that triggers notifications and scripts when you stop checking in"
 readme = "README.md"
 license = "MIT"

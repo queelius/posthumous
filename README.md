@@ -6,13 +6,16 @@ A lightweight, federated deadman switch. Users check in periodically via TOTP; i
 
 - **TOTP authentication**: Works with any authenticator app (Google Authenticator, Authy, etc.)
 - **Federated**: Multiple nodes sync check-ins; any single node can trigger (failure mode: duplicates, not silence)
+- **Self-healing**: Nodes auto-recover state from peers on startup if their local state is corrupt or missing
 - **Multi-stage escalation**: Configurable warning → grace → trigger pipeline with callbacks at each stage
-- **Post-trigger scheduling**: Recurring actions after trigger — annual emails, birthday messages, periodic scripts
-- **80+ notification services**: Via [Apprise](https://github.com/caronc/apprise) — ntfy, email, Slack, Discord, Telegram, Pushbullet, Gotify, and more
+- **Post-trigger scheduling**: Recurring actions after trigger, such as annual emails, birthday messages, and periodic scripts
+- **80+ notification services**: Via [Apprise](https://github.com/caronc/apprise). Supports ntfy, email, Slack, Discord, Telegram, Pushbullet, Gotify, and more
 - **Script execution**: Run Python or shell scripts with full event context via environment variables and JSON
-- **Web interface**: Dark-themed check-in form with status display
-- **JSON API**: Programmatic check-in and status endpoints
-- **Portable**: Runs on laptop, Raspberry Pi, VPS — anywhere Python 3.10+ is available
+- **Web interface**: Dark-themed check-in form with CSRF protection
+- **JSON API**: Programmatic check-in and status endpoints (HMAC-signed peer sync with replay protection)
+- **Systemd integration**: `phm service install` sets up a hardened user service with sd_notify watchdog heartbeat
+- **Encryption at rest**: PBKDF2-HMAC-SHA256 with per-file random salts for encrypted state files
+- **Portable**: Runs on laptop, Raspberry Pi, or VPS. Anywhere Python 3.10+ is available.
 
 ## Installation
 
