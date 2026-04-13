@@ -567,3 +567,46 @@ class TestStateFilePermissions:
         state.save(path)
         mode = stat.S_IMODE(path.stat().st_mode)
         assert mode == 0o600
+
+
+class TestPendingQuorumState:
+    """Tests for the PENDING_QUORUM state added in v0.7."""
+
+    def test_pending_quorum_status_exists(self):
+        from posthumous.state import Status
+        assert Status.PENDING_QUORUM.value == "pending_quorum"
+
+    def test_grace_can_transition_to_pending_quorum(self):
+        from posthumous.state import State, Status
+        state = State()
+        state.status = Status.GRACE
+        assert state.transition_to(Status.PENDING_QUORUM) is True
+        assert state.status == Status.PENDING_QUORUM
+
+    def test_pending_quorum_can_transition_to_triggered(self):
+        from posthumous.state import State, Status
+        state = State()
+        state.status = Status.PENDING_QUORUM
+        assert state.transition_to(Status.TRIGGERED) is True
+        assert state.status == Status.TRIGGERED
+
+    def test_pending_quorum_can_transition_back_to_grace(self):
+        from posthumous.state import State, Status
+        state = State()
+        state.status = Status.PENDING_QUORUM
+        assert state.transition_to(Status.GRACE) is True
+        assert state.status == Status.GRACE
+
+    def test_pending_quorum_can_be_reset_by_checkin(self):
+        from posthumous.state import State, Status
+        state = State()
+        state.status = Status.PENDING_QUORUM
+        assert state.transition_to(Status.ARMED) is True
+        assert state.status == Status.ARMED
+
+    def test_armed_cannot_skip_directly_to_pending_quorum(self):
+        from posthumous.state import State, Status
+        state = State()
+        state.status = Status.ARMED
+        assert state.transition_to(Status.PENDING_QUORUM) is False
+        assert state.status == Status.ARMED

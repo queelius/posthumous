@@ -256,6 +256,7 @@ class Server:
         # Peer sync endpoints
         self.app.router.add_post('/sync/checkin', self.handle_sync_checkin)
         self.app.router.add_post('/sync/trigger', self.handle_sync_trigger)
+        self.app.router.add_post('/sync/trigger_intent', self.handle_sync_trigger_intent)
         self.app.router.add_post('/sync/scheduled', self.handle_sync_scheduled)
         self.app.router.add_get('/sync/state', self.handle_sync_state)
 
@@ -297,6 +298,13 @@ class Server:
             return f"Last check-in: {since} ago<br>Trigger in: {trigger}"
 
         return f"Last check-in: {since} ago"
+
+    def _self_url(self) -> str:
+        """Return the canonical URL used to identify this node in confirmations."""
+        listen = self.config.listen
+        if listen.startswith("http"):
+            return listen
+        return f"http://{listen}"
 
     def _verify_sync_message(
         self, timestamp_str: str, signature: str, message_prefix: str
@@ -641,6 +649,30 @@ class Server:
             logger.warning(f"Sync trigger rejected: {error}")
             return web.json_response({'error': error}, status=401)
 
+        # v0.7: if quorum is configured locally, require a valid bundle.
+        # Even if quorum is not configured, a bundle in the payload is verified
+        # if present (defense in depth).
+        intent_id = data.get("intent_id")
+        intent_timestamp = data.get("intent_timestamp")
+        bundle_raw = data.get("confirmations")
+
+        quorum_required = self.config.quorum is not None
+
+        if quorum_required and bundle_raw is None:
+            logger.warning("Quorum configured but trigger arrived without bundle")
+            return web.json_response({"error": "Quorum bundle required"}, status=401)
+
+        if bundle_raw is not None:
+            from posthumous.quorum import Confirmation, QuorumCoordinator
+            bundle = [
+                Confirmation(peer_url=b["peer_url"], signature=b["signature"])
+                for b in bundle_raw
+            ]
+            coordinator = QuorumCoordinator(self.config, self.state_manager, self.peer_manager)
+            if not coordinator.verify_confirmation_bundle(bundle, intent_id, intent_timestamp):
+                logger.warning("Quorum bundle verification failed")
+                return web.json_response({"error": "Invalid quorum bundle"}, status=401)
+
         # Mark as triggered with the peer's timestamp (defense in depth)
         from posthumous.state import Status
         try:
@@ -651,6 +683,57 @@ class Server:
         logger.info("Received trigger broadcast from peer")
 
         return web.json_response({'success': True})
+
+    async def handle_sync_trigger_intent(self, request: web.Request) -> web.Response:
+        """Receive a trigger intent broadcast and respond with a vote."""
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+
+        intent_id = data.get("intent_id")
+        timestamp = data.get("timestamp")
+        signature = data.get("signature")
+        if not intent_id or not timestamp or not signature:
+            return web.json_response({"error": "Missing fields"}, status=400)
+
+        from posthumous.quorum import verify_intent, sign_confirmation
+        try:
+            msg_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+        except (ValueError, AttributeError):
+            return web.json_response({"error": "Malformed timestamp"}, status=401)
+        if abs((datetime.now(timezone.utc) - msg_time).total_seconds()) > self.SYNC_FRESHNESS_SECONDS:
+            return web.json_response({"error": "Stale timestamp"}, status=401)
+        if not verify_intent(self.config.secret_key, intent_id, timestamp, signature):
+            return web.json_response({"error": "Invalid signature"}, status=401)
+
+        # Decide our vote based on our own state. If our calculated status
+        # would be TRIGGERED right now, we confirm.
+        calculated = self.watchdog.calculate_status()
+        peer_url = self._self_url()
+
+        if calculated == Status.TRIGGERED:
+            sig = sign_confirmation(self.config.secret_key, intent_id, timestamp, peer_url)
+            return web.json_response(
+                {
+                    "intent_id": intent_id,
+                    "vote": "confirm",
+                    "peer_url": peer_url,
+                    "signature": sig,
+                },
+                status=200,
+            )
+
+        last_checkin = self.state_manager.state.last_checkin
+        return web.json_response(
+            {
+                "intent_id": intent_id,
+                "vote": "reject",
+                "peer_url": peer_url,
+                "last_checkin": last_checkin.isoformat() if last_checkin else None,
+            },
+            status=409,
+        )
 
     async def handle_sync_scheduled(self, request: web.Request) -> web.Response:
         """Handle scheduled item completion broadcast from peer."""

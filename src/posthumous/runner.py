@@ -20,6 +20,7 @@ from posthumous.auth import Authenticator
 from posthumous.config import Config, NotificationAction, ScriptAction
 from posthumous.notifications import NotificationManager, build_context
 from posthumous.peers import PeerManager
+from posthumous.quorum import QuorumCoordinator
 from posthumous.scheduler import Scheduler, ScheduledExecution
 from posthumous.scripts import ScriptContext, ScriptRunner
 from posthumous.server import Server
@@ -52,6 +53,7 @@ class DaemonRunner:
         self.script_runner: ScriptRunner | None = None
         self.authenticator: Authenticator | None = None
         self.peer_manager: PeerManager | None = None
+        self.quorum_coordinator: QuorumCoordinator | None = None
         self.watchdog: Watchdog | None = None
         self.scheduler: Scheduler | None = None
         self.server: Server | None = None
@@ -115,6 +117,12 @@ class DaemonRunner:
             on_peer_down=self.on_peer_down,
         )
 
+        # Quorum coordinator is only built if quorum is configured (v0.7).
+        if self.config.quorum is not None:
+            self.quorum_coordinator = QuorumCoordinator(
+                self.config, self.state_manager, self.peer_manager
+            )
+
         # Watchdog fires on_warning / on_grace / on_trigger as state transitions
         self.watchdog = Watchdog(
             config,
@@ -122,6 +130,7 @@ class DaemonRunner:
             on_warning=self.on_warning,
             on_grace=self.on_grace,
             on_trigger=self.on_trigger,
+            quorum_coordinator=self.quorum_coordinator,
         )
 
         # Scheduler fires on_scheduled_complete after each scheduled action

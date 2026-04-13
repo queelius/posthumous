@@ -77,6 +77,18 @@ class ScheduledItem:
 
 
 @dataclass
+class QuorumConfig:
+    """Quorum requirements for triggering (v0.7).
+
+    When set on a Config, the watchdog will not transition to TRIGGERED
+    on its own. Instead it broadcasts an intent and requires `required`
+    confirmations from peers (counting self) within `window_seconds`.
+    """
+    required: int = 1
+    window_seconds: int = 30
+
+
+@dataclass
 class Config:
     """Main configuration for a Posthumous node."""
 
@@ -119,6 +131,9 @@ class Config:
     # Peer health monitoring
     peer_check_interval: timedelta = field(default_factory=lambda: timedelta(minutes=30))
     peer_down_threshold: timedelta = field(default_factory=lambda: timedelta(hours=6))
+
+    # Quorum (v0.7)
+    quorum: QuorumConfig | None = None
 
     # Base URL for constructing check-in/dashboard links in notifications
     base_url: str | None = None
@@ -207,6 +222,15 @@ class Config:
         # Parse actions from nested structure
         actions_config = data.get('actions', {})
 
+        # Parse optional quorum block (v0.7)
+        quorum_data = data.get('quorum')
+        quorum = None
+        if quorum_data is not None:
+            quorum = QuorumConfig(
+                required=quorum_data.get('required', 1),
+                window_seconds=quorum_data.get('window_seconds', 30),
+            )
+
         return cls(
             node_name=data['node_name'],
             secret_key=data['secret_key'],
@@ -228,6 +252,7 @@ class Config:
             check_interval=parse_duration(data['check_interval']) if 'check_interval' in data else None,
             peer_check_interval=get_duration('peer_check_interval', timedelta(minutes=30)),
             peer_down_threshold=get_duration('peer_down_threshold', timedelta(hours=6)),
+            quorum=quorum,
             base_url=data.get('base_url'),
             encrypt_at_rest=data.get('encrypt_at_rest', False),
             config_dir=config_dir,
@@ -325,6 +350,12 @@ class Config:
 
         if self.encrypt_at_rest:
             data['encrypt_at_rest'] = True
+
+        if self.quorum is not None:
+            data['quorum'] = {
+                'required': self.quorum.required,
+                'window_seconds': self.quorum.window_seconds,
+            }
 
         return data
 
@@ -424,6 +455,18 @@ class Config:
                 errors.append(
                     f"Scheduled item '{item.name}' references unknown channel: {item.notify}"
                 )
+
+        # Quorum validation (v0.7)
+        if self.quorum is not None:
+            if self.quorum.required < 1:
+                errors.append(f"quorum.required must be >= 1, got {self.quorum.required}")
+            federation_size = len(self.peers) + 1  # +1 for self
+            if self.quorum.required > federation_size:
+                errors.append(
+                    f"quorum.required ({self.quorum.required}) exceeds federation size ({federation_size})"
+                )
+            if self.quorum.window_seconds <= 0:
+                errors.append(f"quorum.window_seconds must be > 0, got {self.quorum.window_seconds}")
 
         return errors
 

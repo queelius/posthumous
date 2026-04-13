@@ -6,6 +6,7 @@ A lightweight, federated deadman switch. Users check in periodically via TOTP; i
 
 - **TOTP authentication**: Works with any authenticator app (Google Authenticator, Authy, etc.)
 - **Federated**: Multiple nodes sync check-ins; any single node can trigger (failure mode: duplicates, not silence)
+- **Quorum-based triggering** (optional, v0.7+): Require M-of-N peer confirmation before triggering, so a single compromised peer cannot fire the deadman switch alone
 - **Self-healing**: Nodes auto-recover state from peers on startup if their local state is corrupt or missing
 - **Multi-stage escalation**: Configurable warning → grace → trigger pipeline with callbacks at each stage
 - **Post-trigger scheduling**: Recurring actions after trigger, such as annual emails, birthday messages, and periodic scripts

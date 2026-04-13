@@ -191,20 +191,65 @@ class PeerManager:
             update_peer_state=True,
         )
 
-    async def broadcast_trigger(self, timestamp: datetime) -> dict[str, bool]:
-        """Broadcast trigger event to all peers."""
+    async def broadcast_trigger(
+        self,
+        timestamp: datetime,
+        intent_id: str | None = None,
+        intent_timestamp: str | None = None,
+        confirmations: list | None = None,  # list[Confirmation] when v0.7 quorum is in use
+    ) -> dict[str, bool]:
+        """Broadcast trigger event to all peers.
+
+        v0.6 mode: pass only `timestamp`. The trigger is accepted by peers
+        based on the outer HMAC signature.
+
+        v0.7 mode: pass `intent_id`, `intent_timestamp`, and `confirmations`.
+        The bundle is attached so each peer can independently verify quorum.
+        """
         timestamp_str = timestamp.isoformat()
         signature = sign_message(self.config.secret_key, f"trigger:{timestamp_str}")
 
-        return await self._broadcast_to_all(
-            "sync/trigger",
-            {
-                "event": "triggered",
-                "timestamp": timestamp_str,
-                "signature": signature,
-                "node": self.config.node_name,
-            },
-        )
+        payload: dict = {
+            "event": "triggered",
+            "timestamp": timestamp_str,
+            "signature": signature,
+            "node": self.config.node_name,
+        }
+
+        if intent_id is not None and confirmations is not None:
+            payload["intent_id"] = intent_id
+            payload["intent_timestamp"] = intent_timestamp
+            payload["confirmations"] = [
+                {"peer_url": c.peer_url, "signature": c.signature} for c in confirmations
+            ]
+
+        return await self._broadcast_to_all("sync/trigger", payload)
+
+    async def broadcast_trigger_intent(self, intent_payload: dict) -> dict[str, dict]:
+        """Broadcast an intent to all peers and collect their vote responses.
+
+        Unlike other broadcasts, we want the response body (the vote), not
+        just success/failure. Returns a dict mapping peer_url -> response dict.
+        Peers that returned non-200/409 or errored are absent from the result.
+        """
+        if not self.config.peers:
+            return {}
+
+        async def post_and_parse(peer_url: str) -> tuple[str, dict | None]:
+            url = f"{peer_url.rstrip('/')}/sync/trigger_intent"
+            try:
+                session = await self._get_session()
+                async with session.post(url, json=intent_payload) as response:
+                    if response.status in (200, 409):
+                        return peer_url, await response.json()
+                    return peer_url, None
+            except Exception as e:
+                logger.debug(f"intent broadcast to {peer_url} failed: {e}")
+                return peer_url, None
+
+        tasks = [post_and_parse(url) for url in self.config.peers]
+        results = await asyncio.gather(*tasks)
+        return {url: resp for url, resp in results if resp is not None}
 
     async def broadcast_scheduled_complete(
         self,

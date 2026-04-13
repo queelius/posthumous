@@ -1421,3 +1421,108 @@ class TestPeerEdgeCases:
             assert verify_signature(config.secret_key, f"state:{ts}", sig)
 
         await manager.close()
+
+
+class TestBroadcastTriggerIntent:
+    @pytest.fixture
+    def config(self):
+        return Config(
+            node_name="self",
+            secret_key="JBSWY3DPEHPK3PXP",
+            peers=["https://peer1.local:8420"],
+        )
+
+    @pytest.fixture
+    def state_manager(self, tmp_path):
+        return StateManager(tmp_path / "state.yaml")
+
+    @pytest.mark.asyncio
+    async def test_broadcast_trigger_intent_returns_per_peer_responses(self, config, state_manager):
+        from posthumous.peers import PeerManager
+        from aioresponses import aioresponses
+
+        manager = PeerManager(config, state_manager)
+        intent_payload = {
+            "intent_id": "abc-123",
+            "timestamp": "2026-04-12T18:00:00+00:00",
+            "signature": "sig",
+        }
+
+        with aioresponses() as m:
+            m.post("https://peer1.local:8420/sync/trigger_intent", payload={
+                "intent_id": "abc-123",
+                "vote": "confirm",
+                "peer_url": "https://peer1.local:8420",
+                "signature": "peersig",
+            })
+            responses = await manager.broadcast_trigger_intent(intent_payload)
+
+        assert "https://peer1.local:8420" in responses
+        assert responses["https://peer1.local:8420"]["vote"] == "confirm"
+        await manager.close()
+
+
+class TestBroadcastTriggerWithBundle:
+    @pytest.mark.asyncio
+    async def test_broadcast_trigger_includes_bundle_when_provided(self, tmp_path):
+        from posthumous.peers import PeerManager
+        from posthumous.quorum import Confirmation
+        from aioresponses import aioresponses, CallbackResult
+
+        config = Config(
+            node_name="self",
+            secret_key="JBSWY3DPEHPK3PXP",
+            peers=["https://peer1.local:8420"],
+        )
+        state_manager = StateManager(tmp_path / "state.yaml")
+        manager = PeerManager(config, state_manager)
+
+        bundle = [
+            Confirmation(peer_url="https://self.local:8420", signature="s1"),
+            Confirmation(peer_url="https://peer1.local:8420", signature="s2"),
+        ]
+        captured = {}
+
+        def cb(url, **kwargs):
+            captured.update(kwargs.get("json", {}))
+            return CallbackResult(payload={"success": True})
+
+        with aioresponses() as m:
+            m.post("https://peer1.local:8420/sync/trigger", callback=cb)
+            await manager.broadcast_trigger(
+                datetime.now(timezone.utc),
+                intent_id="abc-123",
+                intent_timestamp="2026-04-12T18:00:00+00:00",
+                confirmations=bundle,
+            )
+
+        assert captured.get("intent_id") == "abc-123"
+        assert "confirmations" in captured
+        assert len(captured["confirmations"]) == 2
+        await manager.close()
+
+    @pytest.mark.asyncio
+    async def test_broadcast_trigger_omits_bundle_when_not_provided(self, tmp_path):
+        from posthumous.peers import PeerManager
+        from aioresponses import aioresponses, CallbackResult
+
+        config = Config(
+            node_name="self",
+            secret_key="JBSWY3DPEHPK3PXP",
+            peers=["https://peer1.local:8420"],
+        )
+        state_manager = StateManager(tmp_path / "state.yaml")
+        manager = PeerManager(config, state_manager)
+        captured = {}
+
+        def cb(url, **kwargs):
+            captured.update(kwargs.get("json", {}))
+            return CallbackResult(payload={"success": True})
+
+        with aioresponses() as m:
+            m.post("https://peer1.local:8420/sync/trigger", callback=cb)
+            await manager.broadcast_trigger(datetime.now(timezone.utc))
+
+        assert "intent_id" not in captured
+        assert "confirmations" not in captured
+        await manager.close()

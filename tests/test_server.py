@@ -67,6 +67,56 @@ async def client(config, state_manager, watchdog, authenticator, peer_manager):
         yield test_client
 
 
+@pytest.fixture
+def config_with_quorum():
+    """Create a test configuration with quorum enabled (v0.7)."""
+    from posthumous.config import QuorumConfig
+    return Config(
+        node_name="test-node",
+        secret_key=SECRET,
+        listen="127.0.0.1:8420",
+        checkin_interval=timedelta(days=7),
+        warning_start=timedelta(days=8),
+        grace_start=timedelta(days=12),
+        trigger_at=timedelta(days=14),
+        peers=["https://peer1.local:8420"],
+        quorum=QuorumConfig(required=2, window_seconds=30),
+    )
+
+
+@pytest.fixture
+def state_manager_with_quorum(tmp_path):
+    """Create a separate test state manager for the quorum-enabled client."""
+    return StateManager(tmp_path / "state_quorum.yaml")
+
+
+@pytest.fixture
+def watchdog_with_quorum(config_with_quorum, state_manager_with_quorum):
+    """Create a Watchdog for the quorum-enabled client."""
+    from posthumous.watchdog import Watchdog
+    return Watchdog(config_with_quorum, state_manager_with_quorum)
+
+
+@pytest.fixture
+async def client_with_quorum(
+    config_with_quorum,
+    state_manager_with_quorum,
+    watchdog_with_quorum,
+    authenticator,
+    peer_manager,
+):
+    """Create an aiohttp test client with quorum enabled."""
+    server = Server(
+        config_with_quorum,
+        state_manager_with_quorum,
+        watchdog_with_quorum,
+        authenticator,
+        peer_manager,
+    )
+    async with TestClient(TestServer(server.app)) as test_client:
+        yield test_client
+
+
 def generate_totp() -> str:
     """Generate a valid TOTP code for the test secret."""
     return pyotp.TOTP(SECRET, issuer="Posthumous").now()
@@ -529,6 +579,145 @@ class TestSyncTriggerTimestamp:
         assert state_manager.state.status == Status.TRIGGERED
         # The trigger_time should be the peer's timestamp, not a locally-generated now()
         assert state_manager.state.trigger_time == peer_time
+
+
+class TestSyncTriggerIntent:
+    """Tests for POST /sync/trigger_intent (v0.7)."""
+
+    @pytest.mark.asyncio
+    async def test_confirms_when_state_is_overdue(self, client, state_manager):
+        from posthumous.quorum import sign_intent, verify_confirmation
+        # Make state appear overdue
+        state_manager.state.last_checkin = datetime.now(timezone.utc) - timedelta(days=20)
+        intent_id = "abc-123"
+        timestamp = datetime.now(timezone.utc).isoformat()
+        payload = {
+            "intent_id": intent_id,
+            "timestamp": timestamp,
+            "signature": sign_intent(SECRET, intent_id, timestamp),
+        }
+        resp = await client.post("/sync/trigger_intent", json=payload)
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["vote"] == "confirm"
+        assert verify_confirmation(SECRET, intent_id, timestamp, data["peer_url"], data["signature"])
+
+    @pytest.mark.asyncio
+    async def test_rejects_when_state_is_recent(self, client, state_manager):
+        from posthumous.quorum import sign_intent
+        state_manager.state.last_checkin = datetime.now(timezone.utc) - timedelta(minutes=1)
+        intent_id = "abc-123"
+        timestamp = datetime.now(timezone.utc).isoformat()
+        payload = {
+            "intent_id": intent_id,
+            "timestamp": timestamp,
+            "signature": sign_intent(SECRET, intent_id, timestamp),
+        }
+        resp = await client.post("/sync/trigger_intent", json=payload)
+        assert resp.status == 409
+        data = await resp.json()
+        assert data["vote"] == "reject"
+        assert "last_checkin" in data
+
+    @pytest.mark.asyncio
+    async def test_rejects_invalid_signature(self, client):
+        intent_id = "abc-123"
+        timestamp = datetime.now(timezone.utc).isoformat()
+        payload = {
+            "intent_id": intent_id,
+            "timestamp": timestamp,
+            "signature": "forged-but-not-base16-or-whatever",
+        }
+        resp = await client.post("/sync/trigger_intent", json=payload)
+        assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_rejects_stale_timestamp(self, client):
+        from posthumous.quorum import sign_intent
+        intent_id = "abc-123"
+        timestamp = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        payload = {
+            "intent_id": intent_id,
+            "timestamp": timestamp,
+            "signature": sign_intent(SECRET, intent_id, timestamp),
+        }
+        resp = await client.post("/sync/trigger_intent", json=payload)
+        assert resp.status == 401
+
+
+class TestSyncTriggerWithBundle:
+    @pytest.mark.asyncio
+    async def test_accepts_trigger_with_valid_bundle(self, client_with_quorum, state_manager_with_quorum):
+        from posthumous.quorum import sign_confirmation
+        # State machine requires GRACE -> TRIGGERED transition
+        state_manager_with_quorum.state.status = Status.GRACE
+
+        intent_id = "abc-123"
+        intent_timestamp = "2026-04-12T18:00:00+00:00"
+        timestamp = datetime.now(timezone.utc).isoformat()
+        signature = sign_message(SECRET, f"trigger:{timestamp}")
+
+        bundle = [
+            {"peer_url": "https://self.local:8420",
+             "signature": sign_confirmation(SECRET, intent_id, intent_timestamp, "https://self.local:8420")},
+            {"peer_url": "https://peer1.local:8420",
+             "signature": sign_confirmation(SECRET, intent_id, intent_timestamp, "https://peer1.local:8420")},
+        ]
+
+        payload = {
+            "event": "triggered",
+            "timestamp": timestamp,
+            "signature": signature,
+            "intent_id": intent_id,
+            "intent_timestamp": intent_timestamp,
+            "confirmations": bundle,
+        }
+        resp = await client_with_quorum.post("/sync/trigger", json=payload)
+        assert resp.status == 200
+        assert state_manager_with_quorum.state.status == Status.TRIGGERED
+
+    @pytest.mark.asyncio
+    async def test_rejects_trigger_with_insufficient_bundle(self, client_with_quorum):
+        from posthumous.quorum import sign_confirmation
+        intent_id = "abc-123"
+        intent_timestamp = "2026-04-12T18:00:00+00:00"
+        timestamp = datetime.now(timezone.utc).isoformat()
+        signature = sign_message(SECRET, f"trigger:{timestamp}")
+
+        bundle = [
+            {"peer_url": "https://self.local:8420",
+             "signature": sign_confirmation(SECRET, intent_id, intent_timestamp, "https://self.local:8420")},
+        ]
+        payload = {
+            "event": "triggered",
+            "timestamp": timestamp,
+            "signature": signature,
+            "intent_id": intent_id,
+            "intent_timestamp": intent_timestamp,
+            "confirmations": bundle,
+        }
+        resp = await client_with_quorum.post("/sync/trigger", json=payload)
+        assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_v06_compat_trigger_without_bundle_when_quorum_unset(self, client, state_manager):
+        # State machine requires GRACE -> TRIGGERED transition
+        state_manager.state.status = Status.GRACE
+
+        timestamp = datetime.now(timezone.utc).isoformat()
+        signature = sign_message(SECRET, f"trigger:{timestamp}")
+        payload = {"event": "triggered", "timestamp": timestamp, "signature": signature}
+        resp = await client.post("/sync/trigger", json=payload)
+        assert resp.status == 200
+        assert state_manager.state.status == Status.TRIGGERED
+
+    @pytest.mark.asyncio
+    async def test_quorum_required_but_no_bundle_rejected(self, client_with_quorum):
+        timestamp = datetime.now(timezone.utc).isoformat()
+        signature = sign_message(SECRET, f"trigger:{timestamp}")
+        payload = {"event": "triggered", "timestamp": timestamp, "signature": signature}
+        resp = await client_with_quorum.post("/sync/trigger", json=payload)
+        assert resp.status == 401
 
 
 class TestSyncScheduled:

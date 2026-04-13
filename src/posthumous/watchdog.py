@@ -83,12 +83,14 @@ class Watchdog:
         on_warning: Callable[[], Awaitable[None]] | None = None,
         on_grace: Callable[[], Awaitable[None]] | None = None,
         on_trigger: Callable[[], Awaitable[None]] | None = None,
+        quorum_coordinator=None,  # QuorumCoordinator | None (typed loosely to avoid import cycle)
     ):
         self.config = config
         self.state_manager = state_manager
         self._on_warning = on_warning
         self._on_grace = on_grace
         self._on_trigger = on_trigger
+        self._quorum_coordinator = quorum_coordinator
         self._task: asyncio.Task | None = None
         self._running = False
 
@@ -221,7 +223,26 @@ class Watchdog:
             return await self._transition_through(Status.WARNING, Status.GRACE)
 
         if expected_status == Status.TRIGGERED:
-            # May need to fire missed callbacks for WARNING and GRACE
+            # If quorum is configured AND we have a coordinator, run the protocol
+            # instead of transitioning directly. The coordinator broadcasts the
+            # trigger to peers; we still apply the local TRIGGERED transition
+            # and fire the on_trigger callback locally.
+            if self.config.quorum is not None and self._quorum_coordinator is not None:
+                # Catch up through WARNING and GRACE first to fire callbacks.
+                await self._transition_through(Status.WARNING, Status.GRACE)
+                # Now attempt quorum.
+                if not self.state_manager.transition(Status.PENDING_QUORUM):
+                    return None
+                success = await self._quorum_coordinator.attempt_trigger()
+                if success:
+                    self.state_manager.transition(Status.TRIGGERED)
+                    await self._fire_callback(Status.TRIGGERED)
+                    return Status.TRIGGERED
+                # Failed. Return to GRACE and let the next tick retry.
+                self.state_manager.transition(Status.GRACE)
+                return Status.GRACE
+
+            # No quorum: existing v0.6 behavior.
             return await self._transition_through(Status.WARNING, Status.GRACE, Status.TRIGGERED)
 
         return None

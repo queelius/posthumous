@@ -771,3 +771,92 @@ class TestOnPeerDown:
         )
         errors = config.validate()
         assert any("nonexistent" in e and "on_peer_down" in e for e in errors)
+
+
+class TestQuorumConfig:
+    """Tests for the optional quorum config block (v0.7)."""
+
+    def test_quorum_default_is_none(self):
+        from posthumous.config import Config
+        cfg = Config(node_name="test", secret_key="JBSWY3DPEHPK3PXP")
+        assert cfg.quorum is None
+
+    def test_parse_quorum_block(self, tmp_path):
+        import yaml
+        from posthumous.config import Config
+        path = tmp_path / "config.yaml"
+        path.write_text(yaml.dump({
+            "node_name": "test",
+            "secret_key": "JBSWY3DPEHPK3PXP",
+            "checkin_interval": "7 days",
+            "warning_start": "8 days",
+            "grace_start": "12 days",
+            "trigger_at": "14 days",
+            "peers": ["http://peer1:8420", "http://peer2:8420"],
+            "quorum": {"required": 2, "window_seconds": 45},
+        }))
+        cfg = Config.from_yaml(path)
+        assert cfg.quorum is not None
+        assert cfg.quorum.required == 2
+        assert cfg.quorum.window_seconds == 45
+
+    def test_quorum_window_default_is_30(self, tmp_path):
+        import yaml
+        from posthumous.config import Config
+        path = tmp_path / "config.yaml"
+        path.write_text(yaml.dump({
+            "node_name": "test",
+            "secret_key": "JBSWY3DPEHPK3PXP",
+            "checkin_interval": "7 days",
+            "warning_start": "8 days",
+            "grace_start": "12 days",
+            "trigger_at": "14 days",
+            "peers": ["http://peer1:8420", "http://peer2:8420"],
+            "quorum": {"required": 2},
+        }))
+        cfg = Config.from_yaml(path)
+        assert cfg.quorum.window_seconds == 30
+
+    def test_to_dict_round_trips_quorum(self):
+        from posthumous.config import Config, QuorumConfig
+        cfg = Config(
+            node_name="test",
+            secret_key="JBSWY3DPEHPK3PXP",
+            peers=["http://peer1:8420"],
+            quorum=QuorumConfig(required=2, window_seconds=20),
+        )
+        data = cfg.to_dict()
+        assert data["quorum"] == {"required": 2, "window_seconds": 20}
+
+    def test_validate_quorum_required_must_be_at_least_one(self):
+        from posthumous.config import Config, QuorumConfig
+        cfg = Config(
+            node_name="test",
+            secret_key="JBSWY3DPEHPK3PXP",
+            peers=["http://peer1:8420"],
+            quorum=QuorumConfig(required=0, window_seconds=30),
+        )
+        errors = cfg.validate()
+        assert any("quorum.required" in e for e in errors)
+
+    def test_validate_quorum_required_cannot_exceed_federation_size(self):
+        from posthumous.config import Config, QuorumConfig
+        cfg = Config(
+            node_name="test",
+            secret_key="JBSWY3DPEHPK3PXP",
+            peers=["http://peer1:8420"],
+            quorum=QuorumConfig(required=5, window_seconds=30),
+        )
+        errors = cfg.validate()
+        assert any("exceeds federation size" in e for e in errors)
+
+    def test_validate_quorum_window_seconds_must_be_positive(self):
+        from posthumous.config import Config, QuorumConfig
+        cfg = Config(
+            node_name="test",
+            secret_key="JBSWY3DPEHPK3PXP",
+            peers=["http://peer1:8420"],
+            quorum=QuorumConfig(required=2, window_seconds=0),
+        )
+        errors = cfg.validate()
+        assert any("window_seconds" in e for e in errors)
