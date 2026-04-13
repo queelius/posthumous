@@ -10,9 +10,9 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [
-    { name = "Your Name", email = "you@example.com" }
+    { name = "Alex Towell", email = "lex@metafunctor.com" }
 ]
-keywords = ["deadman-switch", "notifications", "scheduler", "federated"]
+keywords = ["deadman-switch", "notifications", "scheduler", "federated", "totp", "watchdog"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
@@ -45,6 +45,12 @@ dev = [
     "aioresponses>=0.7",
     "freezegun>=1.2",
 ]
+
+[project.urls]
+Homepage = "https://github.com/queelius/posthumous"
+Repository = "https://github.com/queelius/posthumous"
+Issues = "https://github.com/queelius/posthumous/issues"
+Changelog = "https://github.com/queelius/posthumous/releases"
 
 [project.scripts]
 posthumous = "posthumous.cli:main"
