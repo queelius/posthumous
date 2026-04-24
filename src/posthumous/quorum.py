@@ -10,6 +10,7 @@ the PeerManager passed in at construction time.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from dataclasses import dataclass
@@ -75,14 +76,33 @@ class QuorumCoordinator:
         bundle: list[Confirmation],
         intent_id: str,
         timestamp: str,
+        allowed_peer_urls: set[str] | None = None,
+        max_age_seconds: int | None = None,
     ) -> bool:
         """Verify a bundle of confirmations attached to a trigger broadcast.
 
-        Returns True if the bundle has at least `required` confirmations,
-        no duplicate peer URLs, and all signatures verify against
-        (intent_id, timestamp, peer_url) using the shared secret.
+        Checks:
+        - Bundle has >= required confirmations.
+        - If max_age_seconds is set, intent_timestamp is within that window of now.
+        - If allowed_peer_urls is set, every peer_url in the bundle is in the set
+          (i.e., the voter is a known federation member, not an invented URL).
+        - No duplicate peer_url.
+        - Every signature verifies against (intent_id, timestamp, peer_url).
         """
         required = self.config.quorum.required if self.config.quorum else 1
+
+        if max_age_seconds is not None:
+            try:
+                ts = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+            except (ValueError, AttributeError, TypeError):
+                logger.warning("Malformed intent_timestamp in bundle")
+                return False
+            age = abs((datetime.now(timezone.utc) - ts).total_seconds())
+            if age > max_age_seconds:
+                logger.warning(
+                    f"Bundle intent_timestamp too old ({age:.0f}s, max {max_age_seconds}s)"
+                )
+                return False
 
         if len(bundle) < required:
             logger.warning(
@@ -96,6 +116,12 @@ class QuorumCoordinator:
                 logger.warning(f"Duplicate peer_url in bundle: {conf.peer_url}")
                 return False
             seen_urls.add(conf.peer_url)
+
+            if allowed_peer_urls is not None and conf.peer_url not in allowed_peer_urls:
+                logger.warning(
+                    f"Bundle contains confirmation from non-federation URL: {conf.peer_url}"
+                )
+                return False
 
             if not verify_confirmation(
                 self.config.secret_key, intent_id, timestamp, conf.peer_url, conf.signature
@@ -140,7 +166,17 @@ class QuorumCoordinator:
             "signature": sign_intent(self.config.secret_key, intent_id, timestamp),
         }
 
-        peer_responses = await self.peer_manager.broadcast_trigger_intent(intent_payload)
+        try:
+            peer_responses = await asyncio.wait_for(
+                self.peer_manager.broadcast_trigger_intent(intent_payload),
+                timeout=self.config.quorum.window_seconds,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Quorum window ({self.config.quorum.window_seconds}s) expired "
+                f"before collecting all votes"
+            )
+            peer_responses = {}
 
         for peer_url, response in peer_responses.items():
             if not isinstance(response, dict):
@@ -169,6 +205,17 @@ class QuorumCoordinator:
         logger.info(f"Quorum: collected {len(confirmations)} confirmations, need {required}")
 
         if len(confirmations) < required:
+            return False
+
+        # Before broadcasting, verify the state is still PENDING_QUORUM.
+        # A check-in during vote collection may have transitioned to ARMED,
+        # in which case we must abort to avoid firing a trigger the user cancelled.
+        from posthumous.state import Status
+        if self.state_manager.state.status != Status.PENDING_QUORUM:
+            logger.info(
+                f"Quorum reached but state is {self.state_manager.state.status.value}; "
+                f"aborting trigger broadcast"
+            )
             return False
 
         # Broadcast the trigger with the confirmation bundle.

@@ -516,7 +516,23 @@ All peer sync messages are signed with HMAC-SHA256 using the shared `secret_key`
 signature = HMAC-SHA256(secret_key, "checkin:<timestamp>")
 signature = HMAC-SHA256(secret_key, "trigger:<timestamp>")
 signature = HMAC-SHA256(secret_key, "scheduled:<item_name>:<period>")
+signature = HMAC-SHA256(secret_key, "trigger_intent:<intent_id>:<timestamp>")
+signature = HMAC-SHA256(secret_key, "confirm:<intent_id>:<timestamp>:<peer_url>")
 ```
+
+### Quorum (opt-in, v0.7+)
+
+By default, any single node can broadcast a trigger and all peers apply it. Quorum changes this: a node that decides to trigger first broadcasts an intent, collects signed confirmations from peers, and only applies the trigger when at least `required` confirmations (including self) arrive within `window_seconds`.
+
+```yaml
+quorum:
+  required: 2            # M: minimum confirmations including self
+  window_seconds: 30     # how long to wait for peer confirmations
+```
+
+Peers vote `confirm` only if their own local timer has also elapsed, so quorum genuinely requires independent agreement across peers. If quorum fails (partition, disagreement), the node stays in `GRACE` and retries on the next tick. This is a **fail-closed** design: stuck without a trigger is preferred to a trigger from a single compromised host.
+
+**Known limitation (see Security below):** because all nodes share the same HMAC secret, an attacker who obtains the secret can assemble a quorum bundle without actually compromising M peers. v0.7 quorum raises the bar against specific compromise paths (a single rogue peer cannot unilaterally trigger) but does not provide true Byzantine fault tolerance. Planned for v0.8: per-peer identity keys.
 
 ## Security
 
@@ -535,6 +551,17 @@ For automation, set `api_token` in config. Use with `posthumous checkin --token 
 ### Peer Authentication
 
 All peer communication is signed with the shared TOTP secret using HMAC-SHA256. Invalid signatures are rejected and logged.
+
+### Threat Model and Known Limitations
+
+Posthumous's security boundaries:
+
+- **Unauthenticated network attackers** cannot trigger the deadman switch. All sync endpoints verify HMAC signatures using the shared secret. Messages older than 5 minutes are rejected (replay protection).
+- **A single compromised peer** *without quorum configured* CAN trigger the entire federation. With quorum enabled, a single compromised peer without the shared secret cannot.
+- **An attacker who obtains the shared `secret_key`** can currently forge arbitrary sync messages, including quorum-confirmed trigger bundles. Quorum's "M-of-N must agree" guarantee assumes the secret is not compromised. This is a consequence of using a single shared HMAC secret across all federation members.
+- **State at rest** is optionally encrypted (`encrypt_at_rest: true`) using PBKDF2-HMAC-SHA256 key derivation with per-file random salts. The encryption key is derived from the shared secret.
+
+Planned for v0.8: per-peer signing keys so that forging a quorum bundle genuinely requires compromising M peers, not just one secret holder.
 
 ## CLI Reference
 

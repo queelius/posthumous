@@ -175,6 +175,18 @@ class TestCheckinPage:
         assert "WARNING" in text
         assert "warning" in text  # CSS class
 
+    @pytest.mark.asyncio
+    async def test_checkin_form_renders_pending_quorum_css(self, client, state_manager):
+        """PENDING_QUORUM must have a distinct CSS rule so the dashboard colors it."""
+        state_manager.state.status = Status.PENDING_QUORUM
+        resp = await client.get("/checkin")
+
+        text = await resp.text()
+        # Status enum value
+        assert "pending_quorum" in text
+        # CSS rule exists in the style block
+        assert ".status.pending_quorum" in text
+
 
 class TestCheckinJSON:
     """Tests for POST /checkin with JSON content type."""
@@ -644,6 +656,17 @@ class TestSyncTriggerIntent:
         resp = await client.post("/sync/trigger_intent", json=payload)
         assert resp.status == 401
 
+    @pytest.mark.asyncio
+    async def test_malformed_timestamp_returns_400(self, client):
+        """Malformed timestamp is a client input error (400), not an auth failure (401)."""
+        payload = {
+            "intent_id": "abc-123",
+            "timestamp": "not-a-real-timestamp",
+            "signature": "sig-doesnt-matter-we-reject-before-checking",
+        }
+        resp = await client.post("/sync/trigger_intent", json=payload)
+        assert resp.status == 400
+
 
 class TestSyncTriggerWithBundle:
     @pytest.mark.asyncio
@@ -653,15 +676,21 @@ class TestSyncTriggerWithBundle:
         state_manager_with_quorum.state.status = Status.GRACE
 
         intent_id = "abc-123"
-        intent_timestamp = "2026-04-12T18:00:00+00:00"
+        # Use a fresh timestamp so the bundle freshness check passes
+        intent_timestamp = datetime.now(timezone.utc).isoformat()
         timestamp = datetime.now(timezone.utc).isoformat()
         signature = sign_message(SECRET, f"trigger:{timestamp}")
 
+        # Voter URLs must be in the allowed set (configured peers + self_url).
+        # The test config uses listen="127.0.0.1:8420" -> self_url "http://127.0.0.1:8420",
+        # and peers=["https://peer1.local:8420"].
+        self_url = "http://127.0.0.1:8420"
+        peer_url = "https://peer1.local:8420"
         bundle = [
-            {"peer_url": "https://self.local:8420",
-             "signature": sign_confirmation(SECRET, intent_id, intent_timestamp, "https://self.local:8420")},
-            {"peer_url": "https://peer1.local:8420",
-             "signature": sign_confirmation(SECRET, intent_id, intent_timestamp, "https://peer1.local:8420")},
+            {"peer_url": self_url,
+             "signature": sign_confirmation(SECRET, intent_id, intent_timestamp, self_url)},
+            {"peer_url": peer_url,
+             "signature": sign_confirmation(SECRET, intent_id, intent_timestamp, peer_url)},
         ]
 
         payload = {
@@ -680,13 +709,14 @@ class TestSyncTriggerWithBundle:
     async def test_rejects_trigger_with_insufficient_bundle(self, client_with_quorum):
         from posthumous.quorum import sign_confirmation
         intent_id = "abc-123"
-        intent_timestamp = "2026-04-12T18:00:00+00:00"
+        intent_timestamp = datetime.now(timezone.utc).isoformat()
         timestamp = datetime.now(timezone.utc).isoformat()
         signature = sign_message(SECRET, f"trigger:{timestamp}")
 
+        self_url = "http://127.0.0.1:8420"
         bundle = [
-            {"peer_url": "https://self.local:8420",
-             "signature": sign_confirmation(SECRET, intent_id, intent_timestamp, "https://self.local:8420")},
+            {"peer_url": self_url,
+             "signature": sign_confirmation(SECRET, intent_id, intent_timestamp, self_url)},
         ]
         payload = {
             "event": "triggered",
@@ -890,6 +920,15 @@ class TestDashboard:
         text = await resp.text()
         assert "Never" in text
         assert "No check-ins recorded" in text
+
+    @pytest.mark.asyncio
+    async def test_dashboard_renders_pending_quorum_css(self, client, state_manager):
+        """PENDING_QUORUM state must have a dedicated status-badge CSS rule."""
+        state_manager.state.status = Status.PENDING_QUORUM
+        resp = await client.get("/dashboard")
+        text = await resp.text()
+        assert "pending_quorum" in text
+        assert ".status-badge.pending_quorum" in text
 
     @pytest.mark.asyncio
     async def test_dashboard_with_recent_checkin(self, client, state_manager):

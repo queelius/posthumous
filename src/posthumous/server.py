@@ -64,6 +64,7 @@ CHECKIN_HTML = """<!DOCTYPE html>
         }}
         .status.armed {{ background: #1e5128; }}
         .status.warning {{ background: #7d5a00; }}
+        .status.pending_quorum {{ background: #6a4a00; }}
         .status.grace {{ background: #8b0000; }}
         .status.triggered {{ background: #4a0000; }}
         form {{
@@ -148,6 +149,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }}
         .status-badge.armed {{ background: #1e5128; }}
         .status-badge.warning {{ background: #7d5a00; }}
+        .status-badge.pending_quorum {{ background: #6a4a00; }}
         .status-badge.grace {{ background: #8b0000; }}
         .status-badge.triggered {{ background: #4a0000; }}
         .section {{
@@ -668,8 +670,19 @@ class Server:
                 Confirmation(peer_url=b["peer_url"], signature=b["signature"])
                 for b in bundle_raw
             ]
+
+            # Build set of allowed voter URLs: configured peers plus self.
+            self_url = self._self_url()
+            allowed = set(self.config.peers) | {self_url}
+
             coordinator = QuorumCoordinator(self.config, self.state_manager, self.peer_manager)
-            if not coordinator.verify_confirmation_bundle(bundle, intent_id, intent_timestamp):
+            if not coordinator.verify_confirmation_bundle(
+                bundle,
+                intent_id,
+                intent_timestamp,
+                allowed_peer_urls=allowed,
+                max_age_seconds=self.SYNC_FRESHNESS_SECONDS,
+            ):
                 logger.warning("Quorum bundle verification failed")
                 return web.json_response({"error": "Invalid quorum bundle"}, status=401)
 
@@ -701,7 +714,7 @@ class Server:
         try:
             msg_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
         except (ValueError, AttributeError):
-            return web.json_response({"error": "Malformed timestamp"}, status=401)
+            return web.json_response({"error": "Malformed timestamp"}, status=400)
         if abs((datetime.now(timezone.utc) - msg_time).total_seconds()) > self.SYNC_FRESHNESS_SECONDS:
             return web.json_response({"error": "Stale timestamp"}, status=401)
         if not verify_intent(self.config.secret_key, intent_id, timestamp, signature):

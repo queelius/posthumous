@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import pytest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
@@ -110,6 +111,62 @@ class TestVerifyConfirmationBundle:
         ]
         assert coordinator.verify_confirmation_bundle(bundle, "abc-123", "2026-04-12T18:00:00+00:00") is False
 
+    def test_rejects_bundle_with_unknown_peer_url(self, coordinator):
+        """An attacker with the secret cannot invent peer URLs."""
+        intent_id = "abc-123"
+        timestamp = "2026-04-12T18:00:00+00:00"
+        bundle = [
+            Confirmation(peer_url="https://self.local:8420",
+                         signature=sign_confirmation(SECRET, intent_id, timestamp, "https://self.local:8420")),
+            Confirmation(peer_url="https://attacker.invented:8420",  # not in config.peers
+                         signature=sign_confirmation(SECRET, intent_id, timestamp, "https://attacker.invented:8420")),
+        ]
+        allowed = {"https://self.local:8420", "https://peer1.local:8420", "https://peer2.local:8420"}
+        assert coordinator.verify_confirmation_bundle(
+            bundle, intent_id, timestamp, allowed_peer_urls=allowed
+        ) is False
+
+    def test_accepts_bundle_when_all_urls_in_allowed_set(self, coordinator):
+        intent_id = "abc-123"
+        timestamp = "2026-04-12T18:00:00+00:00"
+        bundle = [
+            Confirmation(peer_url="https://self.local:8420",
+                         signature=sign_confirmation(SECRET, intent_id, timestamp, "https://self.local:8420")),
+            Confirmation(peer_url="https://peer1.local:8420",
+                         signature=sign_confirmation(SECRET, intent_id, timestamp, "https://peer1.local:8420")),
+        ]
+        allowed = {"https://self.local:8420", "https://peer1.local:8420", "https://peer2.local:8420"}
+        assert coordinator.verify_confirmation_bundle(
+            bundle, intent_id, timestamp, allowed_peer_urls=allowed
+        ) is True
+
+    def test_rejects_stale_intent_timestamp(self, coordinator):
+        intent_id = "abc-123"
+        # Craft a bundle with an hour-old intent_timestamp
+        stale_ts = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        bundle = [
+            Confirmation(peer_url="https://self.local:8420",
+                         signature=sign_confirmation(SECRET, intent_id, stale_ts, "https://self.local:8420")),
+            Confirmation(peer_url="https://peer1.local:8420",
+                         signature=sign_confirmation(SECRET, intent_id, stale_ts, "https://peer1.local:8420")),
+        ]
+        assert coordinator.verify_confirmation_bundle(
+            bundle, intent_id, stale_ts, max_age_seconds=300
+        ) is False
+
+    def test_accepts_fresh_intent_timestamp(self, coordinator):
+        intent_id = "abc-123"
+        fresh_ts = datetime.now(timezone.utc).isoformat()
+        bundle = [
+            Confirmation(peer_url="https://self.local:8420",
+                         signature=sign_confirmation(SECRET, intent_id, fresh_ts, "https://self.local:8420")),
+            Confirmation(peer_url="https://peer1.local:8420",
+                         signature=sign_confirmation(SECRET, intent_id, fresh_ts, "https://peer1.local:8420")),
+        ]
+        assert coordinator.verify_confirmation_bundle(
+            bundle, intent_id, fresh_ts, max_age_seconds=300
+        ) is True
+
 
 class TestAttemptTrigger:
     @pytest.fixture
@@ -156,6 +213,9 @@ class TestAttemptTrigger:
         peer_manager.broadcast_trigger_intent = AsyncMock(side_effect=fake_broadcast_intent)
         peer_manager.broadcast_trigger = AsyncMock(return_value={})
 
+        # Pre-set to PENDING_QUORUM to match how watchdog calls this
+        state_manager.state.status = Status.PENDING_QUORUM
+
         coord = QuorumCoordinator(config, state_manager, peer_manager)
         result = await coord.attempt_trigger()
 
@@ -178,6 +238,8 @@ class TestAttemptTrigger:
         peer_manager.broadcast_trigger_intent = AsyncMock(side_effect=fake_broadcast_intent)
         peer_manager.broadcast_trigger = AsyncMock()
 
+        state_manager.state.status = Status.PENDING_QUORUM
+
         coord = QuorumCoordinator(config, state_manager, peer_manager)
         result = await coord.attempt_trigger()
 
@@ -189,6 +251,8 @@ class TestAttemptTrigger:
         peer_manager = MagicMock()
         peer_manager.broadcast_trigger_intent = AsyncMock(return_value={})
         peer_manager.broadcast_trigger = AsyncMock()
+
+        state_manager.state.status = Status.PENDING_QUORUM
 
         coord = QuorumCoordinator(config, state_manager, peer_manager)
         result = await coord.attempt_trigger()
@@ -203,8 +267,69 @@ class TestAttemptTrigger:
         peer_manager.broadcast_trigger_intent = AsyncMock(return_value={})
         peer_manager.broadcast_trigger = AsyncMock(return_value={})
 
+        state_manager.state.status = Status.PENDING_QUORUM
+
         coord = QuorumCoordinator(config, state_manager, peer_manager)
         result = await coord.attempt_trigger()
 
         assert result is True
         peer_manager.broadcast_trigger.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_aborts_if_state_leaves_pending_quorum(self, config, state_manager):
+        """A check-in during vote collection must abort the broadcast."""
+        peer_manager = MagicMock()
+
+        async def fake_broadcast_intent(payload):
+            # Simulate check-in arriving while we're collecting votes
+            state_manager.state.status = Status.ARMED
+            return {
+                "https://peer1.local:8420": self._make_confirm_response(
+                    payload["intent_id"], payload["timestamp"], "https://peer1.local:8420"
+                ),
+            }
+
+        peer_manager.broadcast_trigger_intent = AsyncMock(side_effect=fake_broadcast_intent)
+        peer_manager.broadcast_trigger = AsyncMock()
+
+        # Pre-set to PENDING_QUORUM to match how watchdog calls this
+        state_manager.state.status = Status.PENDING_QUORUM
+
+        coord = QuorumCoordinator(config, state_manager, peer_manager)
+        result = await coord.attempt_trigger()
+
+        assert result is False
+        peer_manager.broadcast_trigger.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_window_timeout_enforced(self, state_manager):
+        """Slow peer responses past window_seconds are treated as non-votes."""
+        config = Config(
+            node_name="self",
+            secret_key=SECRET,
+            listen="https://self.local:8420",
+            peers=["https://peer1.local:8420"],
+            quorum=QuorumConfig(required=2, window_seconds=0.1),  # 100ms
+        )
+        peer_manager = MagicMock()
+
+        async def slow_broadcast_intent(payload):
+            await asyncio.sleep(1.0)  # way past the 0.1s window
+            return {"https://peer1.local:8420": self._make_confirm_response(
+                payload["intent_id"], payload["timestamp"], "https://peer1.local:8420"
+            )}
+
+        peer_manager.broadcast_trigger_intent = AsyncMock(side_effect=slow_broadcast_intent)
+        peer_manager.broadcast_trigger = AsyncMock()
+
+        state_manager.state.status = Status.PENDING_QUORUM
+
+        coord = QuorumCoordinator(config, state_manager, peer_manager)
+        import time
+        start = time.monotonic()
+        result = await coord.attempt_trigger()
+        elapsed = time.monotonic() - start
+
+        assert result is False
+        assert elapsed < 0.5, f"wait_for should have cut off at ~100ms, took {elapsed}s"
+        peer_manager.broadcast_trigger.assert_not_awaited()
