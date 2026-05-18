@@ -303,10 +303,17 @@ class Server:
 
     def _self_url(self) -> str:
         """Return the canonical URL used to identify this node in confirmations."""
-        listen = self.config.listen
-        if listen.startswith("http"):
-            return listen
-        return f"http://{listen}"
+        return self.config.self_url()
+
+    def _check_timestamp_freshness(self, timestamp_str: str) -> str | None:
+        """Return an error string if the timestamp is malformed or outside the freshness window."""
+        try:
+            msg_time = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+        except (ValueError, AttributeError):
+            return "Malformed timestamp"
+        if abs((datetime.now(timezone.utc) - msg_time).total_seconds()) > self.SYNC_FRESHNESS_SECONDS:
+            return "Stale timestamp"
+        return None
 
     def _verify_sync_message(
         self, timestamp_str: str, signature: str, message_prefix: str
@@ -315,16 +322,14 @@ class Server:
 
         Returns None if valid, or an error string if invalid.
         """
-        try:
-            msg_time = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-        except (ValueError, AttributeError):
-            return "Malformed timestamp"
-        if abs((datetime.now(timezone.utc) - msg_time).total_seconds()) > self.SYNC_FRESHNESS_SECONDS:
-            return "Stale timestamp"
+        error = self._check_timestamp_freshness(timestamp_str)
+        if error:
+            return error
 
         from posthumous.auth import verify_signature
-        message = f"{message_prefix}:{timestamp_str}"
-        if not verify_signature(self.config.secret_key, message, signature):
+        if not verify_signature(
+            self.config.secret_key, f"{message_prefix}:{timestamp_str}", signature
+        ):
             return "Invalid signature"
 
         return None
@@ -711,12 +716,10 @@ class Server:
             return web.json_response({"error": "Missing fields"}, status=400)
 
         from posthumous.quorum import verify_intent, sign_confirmation
-        try:
-            msg_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-        except (ValueError, AttributeError):
-            return web.json_response({"error": "Malformed timestamp"}, status=400)
-        if abs((datetime.now(timezone.utc) - msg_time).total_seconds()) > self.SYNC_FRESHNESS_SECONDS:
-            return web.json_response({"error": "Stale timestamp"}, status=401)
+        freshness_error = self._check_timestamp_freshness(timestamp)
+        if freshness_error:
+            status = 400 if freshness_error == "Malformed timestamp" else 401
+            return web.json_response({"error": freshness_error}, status=status)
         if not verify_intent(self.config.secret_key, intent_id, timestamp, signature):
             return web.json_response({"error": "Invalid signature"}, status=401)
 

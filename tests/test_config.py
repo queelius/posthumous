@@ -860,3 +860,95 @@ class TestQuorumConfig:
         )
         errors = cfg.validate()
         assert any("window_seconds" in e for e in errors)
+
+
+class TestPublicUrl:
+    """Tests for the canonical-identity `public_url` field (v0.7.2)."""
+
+    def test_self_url_falls_back_to_listen(self):
+        from posthumous.config import Config
+        cfg = Config(
+            node_name="test", secret_key="JBSWY3DPEHPK3PXP",
+            listen="lex-laptop.local:8420",
+        )
+        assert cfg.self_url() == "http://lex-laptop.local:8420"
+
+    def test_self_url_preserves_http_prefix_in_listen(self):
+        from posthumous.config import Config
+        cfg = Config(
+            node_name="test", secret_key="JBSWY3DPEHPK3PXP",
+            listen="https://node.example.com:8420",
+        )
+        assert cfg.self_url() == "https://node.example.com:8420"
+
+    def test_self_url_uses_public_url_when_set(self):
+        from posthumous.config import Config
+        cfg = Config(
+            node_name="test", secret_key="JBSWY3DPEHPK3PXP",
+            listen="0.0.0.0:8420",
+            public_url="https://node.example.com:8420",
+        )
+        assert cfg.self_url() == "https://node.example.com:8420"
+
+    def test_self_url_strips_trailing_slash(self):
+        from posthumous.config import Config
+        cfg = Config(
+            node_name="test", secret_key="JBSWY3DPEHPK3PXP",
+            public_url="https://node.example.com:8420/",
+        )
+        assert cfg.self_url() == "https://node.example.com:8420"
+
+    def test_validate_rejects_wildcard_listen_without_public_url_when_quorum(self):
+        from posthumous.config import Config, QuorumConfig
+        cfg = Config(
+            node_name="test", secret_key="JBSWY3DPEHPK3PXP",
+            listen="0.0.0.0:8420",
+            peers=["http://peer1:8420"],
+            quorum=QuorumConfig(required=2),
+        )
+        errors = cfg.validate()
+        assert any("public_url is required" in e for e in errors)
+
+    def test_validate_allows_wildcard_listen_when_quorum_disabled(self):
+        from posthumous.config import Config
+        cfg = Config(
+            node_name="test", secret_key="JBSWY3DPEHPK3PXP",
+            listen="0.0.0.0:8420",
+        )
+        # No quorum, no public_url needed.
+        assert not any("public_url" in e for e in cfg.validate())
+
+    def test_validate_accepts_wildcard_listen_with_public_url(self):
+        from posthumous.config import Config, QuorumConfig
+        cfg = Config(
+            node_name="test", secret_key="JBSWY3DPEHPK3PXP",
+            listen="0.0.0.0:8420",
+            public_url="https://node.example.com:8420",
+            peers=["http://peer1:8420"],
+            quorum=QuorumConfig(required=2),
+        )
+        assert not any("public_url" in e for e in cfg.validate())
+
+    def test_validate_rejects_malformed_public_url(self):
+        from posthumous.config import Config
+        cfg = Config(
+            node_name="test", secret_key="JBSWY3DPEHPK3PXP",
+            public_url="node.example.com:8420",  # no scheme
+        )
+        errors = cfg.validate()
+        assert any("public_url must start with http" in e for e in errors)
+
+    def test_to_dict_round_trips_public_url(self, tmp_path):
+        import yaml
+        from posthumous.config import Config
+        cfg = Config(
+            node_name="test", secret_key="JBSWY3DPEHPK3PXP",
+            public_url="https://node.example.com:8420",
+        )
+        data = cfg.to_dict()
+        assert data["public_url"] == "https://node.example.com:8420"
+
+        path = tmp_path / "config.yaml"
+        path.write_text(yaml.dump(data))
+        loaded = Config.from_yaml(path)
+        assert loaded.public_url == "https://node.example.com:8420"

@@ -333,3 +333,81 @@ class TestAttemptTrigger:
         assert result is False
         assert elapsed < 0.5, f"wait_for should have cut off at ~100ms, took {elapsed}s"
         peer_manager.broadcast_trigger.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_returns_false_when_quorum_not_configured(self, state_manager):
+        """attempt_trigger is a no-op (returns False) if config.quorum is None."""
+        config = Config(
+            node_name="self",
+            secret_key=SECRET,
+            listen="https://self.local:8420",
+            quorum=None,
+        )
+        peer_manager = MagicMock()
+        peer_manager.broadcast_trigger_intent = AsyncMock()
+        peer_manager.broadcast_trigger = AsyncMock()
+
+        coord = QuorumCoordinator(config, state_manager, peer_manager)
+        result = await coord.attempt_trigger()
+
+        assert result is False
+        peer_manager.broadcast_trigger_intent.assert_not_awaited()
+        peer_manager.broadcast_trigger.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_ignores_non_dict_peer_response(self, config, state_manager):
+        """A peer that returns something other than a dict is silently ignored."""
+        config.quorum.required = 2
+        peer_manager = MagicMock()
+
+        async def fake_broadcast_intent(payload):
+            return {
+                "https://peer1.local:8420": "not a dict",
+                "https://peer2.local:8420": self._make_confirm_response(
+                    payload["intent_id"], payload["timestamp"], "https://peer2.local:8420"
+                ),
+            }
+
+        peer_manager.broadcast_trigger_intent = AsyncMock(side_effect=fake_broadcast_intent)
+        peer_manager.broadcast_trigger = AsyncMock(return_value={})
+        state_manager.state.status = Status.PENDING_QUORUM
+
+        coord = QuorumCoordinator(config, state_manager, peer_manager)
+        result = await coord.attempt_trigger()
+
+        assert result is True  # self + peer2 = 2, peer1's garbage was dropped
+        kwargs = peer_manager.broadcast_trigger.await_args.kwargs
+        urls = {c.peer_url for c in kwargs["confirmations"]}
+        assert "https://peer1.local:8420" not in urls
+        assert "https://peer2.local:8420" in urls
+
+    @pytest.mark.asyncio
+    async def test_ignores_confirm_vote_missing_signature(self, config, state_manager):
+        """A confirm vote without a signature field is dropped silently."""
+        config.quorum.required = 2
+        peer_manager = MagicMock()
+
+        async def fake_broadcast_intent(payload):
+            return {
+                # peer1: confirm vote with no signature
+                "https://peer1.local:8420": {
+                    "intent_id": payload["intent_id"],
+                    "vote": "confirm",
+                    "peer_url": "https://peer1.local:8420",
+                },
+                "https://peer2.local:8420": self._make_confirm_response(
+                    payload["intent_id"], payload["timestamp"], "https://peer2.local:8420"
+                ),
+            }
+
+        peer_manager.broadcast_trigger_intent = AsyncMock(side_effect=fake_broadcast_intent)
+        peer_manager.broadcast_trigger = AsyncMock(return_value={})
+        state_manager.state.status = Status.PENDING_QUORUM
+
+        coord = QuorumCoordinator(config, state_manager, peer_manager)
+        result = await coord.attempt_trigger()
+
+        assert result is True  # self + peer2 = 2; peer1's malformed vote dropped
+        kwargs = peer_manager.broadcast_trigger.await_args.kwargs
+        urls = {c.peer_url for c in kwargs["confirmations"]}
+        assert "https://peer1.local:8420" not in urls

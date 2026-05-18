@@ -848,3 +848,39 @@ class TestQuorumPath:
         await wd.check_and_transition()
 
         assert sm.state.status == Status.GRACE  # back to grace, not TRIGGERED
+
+    @pytest.mark.asyncio
+    async def test_pending_quorum_on_startup_recovers(self, tmp_path):
+        """A daemon that crashed mid-quorum (state=PENDING_QUORUM on disk) recovers cleanly.
+
+        On the next watchdog tick, the path PENDING_QUORUM -> GRACE -> PENDING_QUORUM
+        is permitted by valid_transitions, and the coordinator runs again.
+        """
+        from posthumous.config import Config, QuorumConfig
+        from posthumous.state import StateManager, Status
+        from posthumous.watchdog import Watchdog
+        from unittest.mock import AsyncMock
+
+        config = Config(
+            node_name="test", secret_key="JBSWY3DPEHPK3PXP",
+            checkin_interval=timedelta(seconds=1),
+            warning_start=timedelta(seconds=2),
+            grace_start=timedelta(seconds=3),
+            trigger_at=timedelta(seconds=4),
+            peers=["https://peer1:8420"],
+            quorum=QuorumConfig(required=2, window_seconds=10),
+        )
+        sm = StateManager(tmp_path / "state.yaml")
+        sm.state.last_checkin = datetime.now(timezone.utc) - timedelta(seconds=10)
+        sm.state.status = Status.PENDING_QUORUM  # crashed mid-protocol
+
+        coordinator = AsyncMock()
+        coordinator.attempt_trigger = AsyncMock(return_value=True)
+
+        wd = Watchdog(config, sm, quorum_coordinator=coordinator)
+        result = await wd.check_and_transition()
+
+        # Coordinator was re-invoked, trigger went through.
+        coordinator.attempt_trigger.assert_awaited_once()
+        assert result == Status.TRIGGERED
+        assert sm.state.status == Status.TRIGGERED

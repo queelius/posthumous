@@ -223,26 +223,23 @@ class Watchdog:
             return await self._transition_through(Status.WARNING, Status.GRACE)
 
         if expected_status == Status.TRIGGERED:
-            # If quorum is configured AND we have a coordinator, run the protocol
-            # instead of transitioning directly. The coordinator broadcasts the
-            # trigger to peers; we still apply the local TRIGGERED transition
-            # and fire the on_trigger callback locally.
+            # Quorum path: run the protocol instead of transitioning directly.
+            # The coordinator handles peer broadcast; we apply the local
+            # TRIGGERED transition and fire on_trigger locally on success.
             if self.config.quorum is not None and self._quorum_coordinator is not None:
-                # Catch up through WARNING and GRACE first to fire callbacks.
+                # Catch up through WARNING and GRACE so their callbacks fire.
                 await self._transition_through(Status.WARNING, Status.GRACE)
-                # Now attempt quorum.
                 if not self.state_manager.transition(Status.PENDING_QUORUM):
                     return None
-                success = await self._quorum_coordinator.attempt_trigger()
-                if success:
+                if await self._quorum_coordinator.attempt_trigger():
                     self.state_manager.transition(Status.TRIGGERED)
                     await self._fire_callback(Status.TRIGGERED)
                     return Status.TRIGGERED
-                # Failed. Return to GRACE and let the next tick retry.
+                # Quorum failed: drop back to GRACE so the next tick retries.
                 self.state_manager.transition(Status.GRACE)
                 return Status.GRACE
 
-            # No quorum: existing v0.6 behavior.
+            # No quorum configured: existing v0.6 behavior.
             return await self._transition_through(Status.WARNING, Status.GRACE, Status.TRIGGERED)
 
         return None

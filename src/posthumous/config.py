@@ -135,6 +135,11 @@ class Config:
     # Quorum (v0.7)
     quorum: QuorumConfig | None = None
 
+    # Canonical identity URL used in quorum bundles. If unset, falls back to
+    # the listen address. Required when listen is a wildcard (0.0.0.0) and
+    # quorum is enabled, because peers must know this node by a routable URL.
+    public_url: str | None = None
+
     # Base URL for constructing check-in/dashboard links in notifications
     base_url: str | None = None
 
@@ -253,6 +258,7 @@ class Config:
             peer_check_interval=get_duration('peer_check_interval', timedelta(minutes=30)),
             peer_down_threshold=get_duration('peer_down_threshold', timedelta(hours=6)),
             quorum=quorum,
+            public_url=data.get('public_url'),
             base_url=data.get('base_url'),
             encrypt_at_rest=data.get('encrypt_at_rest', False),
             config_dir=config_dir,
@@ -357,6 +363,9 @@ class Config:
                 'window_seconds': self.quorum.window_seconds,
             }
 
+        if self.public_url:
+            data['public_url'] = self.public_url
+
         return data
 
     def save(self, path: Path | str | None = None) -> None:
@@ -392,6 +401,17 @@ class Config:
         # Auto-construct from listen, replacing 0.0.0.0 with localhost
         host = self.listen.replace('0.0.0.0', 'localhost')
         return f"http://{host}"
+
+    def self_url(self) -> str:
+        """Canonical identity URL used in quorum confirmations and peer lookups.
+
+        Returns public_url if set (with trailing slash stripped), otherwise
+        falls back to the listen address. This URL must match what other peers
+        list in their `peers:` config for quorum bundle verification to succeed.
+        """
+        if self.public_url:
+            return self.public_url.rstrip('/')
+        return self.listen if self.listen.startswith("http") else f"http://{self.listen}"
 
     def get_encryption_secret(self) -> str | None:
         """Get the encryption secret for state files, or None if encryption is disabled.
@@ -467,6 +487,21 @@ class Config:
                 )
             if self.quorum.window_seconds <= 0:
                 errors.append(f"quorum.window_seconds must be > 0, got {self.quorum.window_seconds}")
+
+            # When listen is a wildcard, the listen-derived self_url cannot
+            # match anything in another peer's `peers:` config. Require an
+            # explicit public_url so peers can verify our signed confirmations.
+            listen_host = self.listen.split(':')[0] if ':' in self.listen else self.listen
+            if listen_host in ('0.0.0.0', '[::]', '::') and not self.public_url:
+                errors.append(
+                    "public_url is required when quorum is enabled and listen binds a "
+                    "wildcard address (got listen='{}')".format(self.listen)
+                )
+
+        # public_url shape (independent of quorum)
+        if self.public_url is not None:
+            if not self.public_url.startswith(('http://', 'https://')):
+                errors.append("public_url must start with http:// or https://")
 
         return errors
 

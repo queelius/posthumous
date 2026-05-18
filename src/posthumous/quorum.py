@@ -95,41 +95,31 @@ class QuorumCoordinator:
             try:
                 ts = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
             except (ValueError, AttributeError, TypeError):
-                logger.warning("Malformed intent_timestamp in bundle")
+                logger.warning("Bundle rejected: malformed intent_timestamp")
                 return False
             age = abs((datetime.now(timezone.utc) - ts).total_seconds())
             if age > max_age_seconds:
-                logger.warning(
-                    f"Bundle intent_timestamp too old ({age:.0f}s, max {max_age_seconds}s)"
-                )
+                logger.warning(f"Bundle rejected: timestamp too old ({age:.0f}s > {max_age_seconds}s)")
                 return False
 
         if len(bundle) < required:
-            logger.warning(
-                f"Quorum bundle has {len(bundle)} confirmations, need {required}"
-            )
+            logger.warning(f"Bundle rejected: {len(bundle)} confirmations < {required} required")
             return False
 
         seen_urls: set[str] = set()
         for conf in bundle:
             if conf.peer_url in seen_urls:
-                logger.warning(f"Duplicate peer_url in bundle: {conf.peer_url}")
+                logger.warning(f"Bundle rejected: duplicate peer_url {conf.peer_url}")
                 return False
-            seen_urls.add(conf.peer_url)
-
             if allowed_peer_urls is not None and conf.peer_url not in allowed_peer_urls:
-                logger.warning(
-                    f"Bundle contains confirmation from non-federation URL: {conf.peer_url}"
-                )
+                logger.warning(f"Bundle rejected: unknown voter {conf.peer_url}")
                 return False
-
             if not verify_confirmation(
                 self.config.secret_key, intent_id, timestamp, conf.peer_url, conf.signature
             ):
-                logger.warning(
-                    f"Invalid confirmation signature for {conf.peer_url} in bundle"
-                )
+                logger.warning(f"Bundle rejected: bad signature from {conf.peer_url}")
                 return False
+            seen_urls.add(conf.peer_url)
 
         return True
 
@@ -150,7 +140,7 @@ class QuorumCoordinator:
         required = self.config.quorum.required
         intent_id = str(uuid.uuid4())
         timestamp = datetime.now(timezone.utc).isoformat()
-        self_url = self.config.listen if self.config.listen.startswith("http") else f"http://{self.config.listen}"
+        self_url = self.config.self_url()
 
         # Self always confirms (we initiated; we believe the trigger is warranted).
         confirmations: list[Confirmation] = [
@@ -179,9 +169,7 @@ class QuorumCoordinator:
             peer_responses = {}
 
         for peer_url, response in peer_responses.items():
-            if not isinstance(response, dict):
-                continue
-            if response.get("vote") != "confirm":
+            if not isinstance(response, dict) or response.get("vote") != "confirm":
                 continue
             sig = response.get("signature")
             returned_url = response.get("peer_url", peer_url)
@@ -192,30 +180,24 @@ class QuorumCoordinator:
                 continue
             confirmations.append(Confirmation(peer_url=returned_url, signature=sig))
 
-        # De-duplicate by peer_url (defensive).
-        seen: set[str] = set()
-        deduped: list[Confirmation] = []
+        # De-duplicate by peer_url (defensive: a malicious peer could echo self_url).
+        by_url: dict[str, Confirmation] = {}
         for c in confirmations:
-            if c.peer_url in seen:
-                continue
-            seen.add(c.peer_url)
-            deduped.append(c)
-        confirmations = deduped
+            by_url.setdefault(c.peer_url, c)
+        confirmations = list(by_url.values())
 
         logger.info(f"Quorum: collected {len(confirmations)} confirmations, need {required}")
 
         if len(confirmations) < required:
             return False
 
-        # Before broadcasting, verify the state is still PENDING_QUORUM.
-        # A check-in during vote collection may have transitioned to ARMED,
-        # in which case we must abort to avoid firing a trigger the user cancelled.
+        # A check-in during vote collection may have transitioned us out of
+        # PENDING_QUORUM (e.g. back to ARMED). Abort rather than fire a trigger
+        # the user cancelled.
         from posthumous.state import Status
-        if self.state_manager.state.status != Status.PENDING_QUORUM:
-            logger.info(
-                f"Quorum reached but state is {self.state_manager.state.status.value}; "
-                f"aborting trigger broadcast"
-            )
+        current = self.state_manager.state.status
+        if current != Status.PENDING_QUORUM:
+            logger.info(f"Quorum reached but state is {current.value}; aborting broadcast")
             return False
 
         # Broadcast the trigger with the confirmation bundle.

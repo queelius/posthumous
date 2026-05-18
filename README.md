@@ -528,7 +528,14 @@ By default, any single node can broadcast a trigger and all peers apply it. Quor
 quorum:
   required: 2            # M: minimum confirmations including self
   window_seconds: 30     # how long to wait for peer confirmations
+
+# Required when `listen` binds a wildcard (0.0.0.0). Every other peer must
+# list this URL in their `peers:` block; it is the canonical identity used
+# in signed quorum confirmations.
+public_url: https://this-node.example.com:8420
 ```
+
+`public_url` exists because the signed identity in a quorum confirmation must match what other peers know this node by. If you listen on `0.0.0.0:8420`, the listen value cannot be a peer URL anywhere; set `public_url` explicitly so peers can verify your signatures. When `listen` is a routable hostname/IP that peers already use (e.g. `node.example.com:8420`), `public_url` is optional and the listen value is used as the canonical identity.
 
 Peers vote `confirm` only if their own local timer has also elapsed, so quorum genuinely requires independent agreement across peers. If quorum fails (partition, disagreement), the node stays in `GRACE` and retries on the next tick. This is a **fail-closed** design: stuck without a trigger is preferred to a trigger from a single compromised host.
 
