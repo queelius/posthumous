@@ -1,5 +1,6 @@
 """Tests for peer communication."""
 
+import re
 import pytest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1423,13 +1424,22 @@ class TestPeerEdgeCases:
         await manager.close()
 
 
-class TestBroadcastTriggerIntent:
+class TestMergeStateFromPeers:
+    """v0.8 startup peer-pull: merge_state_from_peers adopts newer peer state.
+
+    Closes the stale-state false-alarm window for a node returning from
+    being offline.
+    """
+
     @pytest.fixture
-    def config(self):
+    def config(self, tmp_path):
         return Config(
             node_name="self",
             secret_key="JBSWY3DPEHPK3PXP",
             peers=["https://peer1.local:8420"],
+            peer_check_interval=timedelta(seconds=30),
+            peer_down_threshold=timedelta(hours=1),
+            config_dir=tmp_path,
         )
 
     @pytest.fixture
@@ -1437,92 +1447,154 @@ class TestBroadcastTriggerIntent:
         return StateManager(tmp_path / "state.yaml")
 
     @pytest.mark.asyncio
-    async def test_broadcast_trigger_intent_returns_per_peer_responses(self, config, state_manager):
+    async def test_no_peers_means_no_merge(self, tmp_path):
+        from posthumous.peers import PeerManager
+        config = Config(
+            node_name="self", secret_key="JBSWY3DPEHPK3PXP",
+            config_dir=tmp_path,
+        )
+        sm = StateManager(tmp_path / "state.yaml")
+        pm = PeerManager(config, sm)
+        try:
+            changes = await pm.merge_state_from_peers()
+        finally:
+            await pm.close()
+        assert changes == {}
+
+    @pytest.mark.asyncio
+    async def test_adopts_newer_peer_last_checkin(self, config, state_manager):
         from posthumous.peers import PeerManager
         from aioresponses import aioresponses
 
-        manager = PeerManager(config, state_manager)
-        intent_payload = {
-            "intent_id": "abc-123",
-            "timestamp": "2026-04-12T18:00:00+00:00",
-            "signature": "sig",
+        local_checkin = datetime.now(timezone.utc) - timedelta(days=5)
+        peer_checkin = datetime.now(timezone.utc) - timedelta(hours=1)
+        state_manager.state.last_checkin = local_checkin
+
+        peer_state_payload = {
+            "node_name": "peer1",
+            "status": "armed",
+            "last_checkin": peer_checkin.isoformat(),
+            "trigger_time": None,
+            "schedule_state": {},
+        }
+        peer_status_payload = {
+            "status": "armed", "last_checkin": peer_checkin.isoformat(),
         }
 
-        with aioresponses() as m:
-            m.post("https://peer1.local:8420/sync/trigger_intent", payload={
-                "intent_id": "abc-123",
-                "vote": "confirm",
-                "peer_url": "https://peer1.local:8420",
-                "signature": "peersig",
-            })
-            responses = await manager.broadcast_trigger_intent(intent_payload)
+        pm = PeerManager(config, state_manager)
+        try:
+            with aioresponses() as m:
+                m.get(
+                    "https://peer1.local:8420/status",
+                    payload=peer_status_payload, repeat=True,
+                )
+                m.get(
+                    re.compile(r"https://peer1\.local:8420/sync/state"),
+                    payload=peer_state_payload, repeat=True,
+                )
+                changes = await pm.merge_state_from_peers()
+        finally:
+            await pm.close()
 
-        assert "https://peer1.local:8420" in responses
-        assert responses["https://peer1.local:8420"]["vote"] == "confirm"
-        await manager.close()
-
-
-class TestBroadcastTriggerWithBundle:
-    @pytest.mark.asyncio
-    async def test_broadcast_trigger_includes_bundle_when_provided(self, tmp_path):
-        from posthumous.peers import PeerManager
-        from posthumous.quorum import Confirmation
-        from aioresponses import aioresponses, CallbackResult
-
-        config = Config(
-            node_name="self",
-            secret_key="JBSWY3DPEHPK3PXP",
-            peers=["https://peer1.local:8420"],
-        )
-        state_manager = StateManager(tmp_path / "state.yaml")
-        manager = PeerManager(config, state_manager)
-
-        bundle = [
-            Confirmation(peer_url="https://self.local:8420", signature="s1"),
-            Confirmation(peer_url="https://peer1.local:8420", signature="s2"),
-        ]
-        captured = {}
-
-        def cb(url, **kwargs):
-            captured.update(kwargs.get("json", {}))
-            return CallbackResult(payload={"success": True})
-
-        with aioresponses() as m:
-            m.post("https://peer1.local:8420/sync/trigger", callback=cb)
-            await manager.broadcast_trigger(
-                datetime.now(timezone.utc),
-                intent_id="abc-123",
-                intent_timestamp="2026-04-12T18:00:00+00:00",
-                confirmations=bundle,
-            )
-
-        assert captured.get("intent_id") == "abc-123"
-        assert "confirmations" in captured
-        assert len(captured["confirmations"]) == 2
-        await manager.close()
+        assert "last_checkin" in changes
+        assert state_manager.state.last_checkin == peer_checkin
 
     @pytest.mark.asyncio
-    async def test_broadcast_trigger_omits_bundle_when_not_provided(self, tmp_path):
+    async def test_adopts_triggered_status_from_peer(self, config, state_manager):
         from posthumous.peers import PeerManager
-        from aioresponses import aioresponses, CallbackResult
+        from aioresponses import aioresponses
 
-        config = Config(
-            node_name="self",
-            secret_key="JBSWY3DPEHPK3PXP",
-            peers=["https://peer1.local:8420"],
-        )
-        state_manager = StateManager(tmp_path / "state.yaml")
-        manager = PeerManager(config, state_manager)
-        captured = {}
+        # Local thinks ARMED; peer is TRIGGERED.
+        state_manager.state.last_checkin = datetime.now(timezone.utc) - timedelta(days=1)
+        peer_trigger_time = datetime.now(timezone.utc) - timedelta(minutes=5)
 
-        def cb(url, **kwargs):
-            captured.update(kwargs.get("json", {}))
-            return CallbackResult(payload={"success": True})
+        peer_state_payload = {
+            "node_name": "peer1",
+            "status": "triggered",
+            "last_checkin": (datetime.now(timezone.utc) - timedelta(days=20)).isoformat(),
+            "trigger_time": peer_trigger_time.isoformat(),
+            "schedule_state": {},
+        }
+        peer_status_payload = {"status": "triggered", "last_checkin": None}
 
-        with aioresponses() as m:
-            m.post("https://peer1.local:8420/sync/trigger", callback=cb)
-            await manager.broadcast_trigger(datetime.now(timezone.utc))
+        pm = PeerManager(config, state_manager)
+        try:
+            with aioresponses() as m:
+                m.get(
+                    "https://peer1.local:8420/status",
+                    payload=peer_status_payload, repeat=True,
+                )
+                m.get(
+                    re.compile(r"https://peer1\.local:8420/sync/state"),
+                    payload=peer_state_payload, repeat=True,
+                )
+                changes = await pm.merge_state_from_peers()
+        finally:
+            await pm.close()
 
-        assert "intent_id" not in captured
-        assert "confirmations" not in captured
-        await manager.close()
+        assert state_manager.state.status == Status.TRIGGERED
+        assert state_manager.state.trigger_time == peer_trigger_time
+        assert changes.get("status") == "triggered"
+
+    @pytest.mark.asyncio
+    async def test_unreachable_peers_are_silently_skipped(self, config, state_manager):
+        from posthumous.peers import PeerManager
+        from aioresponses import aioresponses
+
+        local_checkin = datetime.now(timezone.utc) - timedelta(days=1)
+        state_manager.state.last_checkin = local_checkin
+
+        pm = PeerManager(config, state_manager)
+        try:
+            with aioresponses() as m:
+                # status endpoint times out
+                from aiohttp import ClientConnectionError
+                m.get("https://peer1.local:8420/status",
+                      exception=ClientConnectionError("connection refused"),
+                      repeat=True)
+                changes = await pm.merge_state_from_peers()
+        finally:
+            await pm.close()
+
+        # Nothing changed; local state intact
+        assert changes == {}
+        assert state_manager.state.last_checkin == local_checkin
+
+    @pytest.mark.asyncio
+    async def test_merge_schedule_state_unions_periods(self, config, state_manager):
+        from posthumous.peers import PeerManager
+        from aioresponses import aioresponses
+
+        # Local has not yet run "yearly" for 2026; peer has.
+        state_manager.state.last_checkin = datetime.now(timezone.utc) - timedelta(hours=1)
+
+        peer_state_payload = {
+            "node_name": "peer1",
+            "status": "armed",
+            "last_checkin": state_manager.state.last_checkin.isoformat(),
+            "trigger_time": None,
+            "schedule_state": {
+                "yearly_email": {"period": "2026", "last_run": "2026-01-01T00:00:00+00:00"},
+            },
+        }
+        peer_status_payload = {
+            "status": "armed",
+            "last_checkin": state_manager.state.last_checkin.isoformat(),
+        }
+
+        pm = PeerManager(config, state_manager)
+        try:
+            with aioresponses() as m:
+                m.get("https://peer1.local:8420/status",
+                      payload=peer_status_payload, repeat=True)
+                m.get(re.compile(r"https://peer1\.local:8420/sync/state"),
+                      payload=peer_state_payload, repeat=True)
+                await pm.merge_state_from_peers()
+        finally:
+            await pm.close()
+
+        item = state_manager.state.schedule_state.get("yearly_email")
+        assert item is not None
+        assert item.period == "2026"
+
+

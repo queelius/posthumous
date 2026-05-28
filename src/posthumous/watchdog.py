@@ -83,14 +83,12 @@ class Watchdog:
         on_warning: Callable[[], Awaitable[None]] | None = None,
         on_grace: Callable[[], Awaitable[None]] | None = None,
         on_trigger: Callable[[], Awaitable[None]] | None = None,
-        quorum_coordinator=None,  # QuorumCoordinator | None (typed loosely to avoid import cycle)
     ):
         self.config = config
         self.state_manager = state_manager
         self._on_warning = on_warning
         self._on_grace = on_grace
         self._on_trigger = on_trigger
-        self._quorum_coordinator = quorum_coordinator
         self._task: asyncio.Task | None = None
         self._running = False
 
@@ -223,23 +221,7 @@ class Watchdog:
             return await self._transition_through(Status.WARNING, Status.GRACE)
 
         if expected_status == Status.TRIGGERED:
-            # Quorum path: run the protocol instead of transitioning directly.
-            # The coordinator handles peer broadcast; we apply the local
-            # TRIGGERED transition and fire on_trigger locally on success.
-            if self.config.quorum is not None and self._quorum_coordinator is not None:
-                # Catch up through WARNING and GRACE so their callbacks fire.
-                await self._transition_through(Status.WARNING, Status.GRACE)
-                if not self.state_manager.transition(Status.PENDING_QUORUM):
-                    return None
-                if await self._quorum_coordinator.attempt_trigger():
-                    self.state_manager.transition(Status.TRIGGERED)
-                    await self._fire_callback(Status.TRIGGERED)
-                    return Status.TRIGGERED
-                # Quorum failed: drop back to GRACE so the next tick retries.
-                self.state_manager.transition(Status.GRACE)
-                return Status.GRACE
-
-            # No quorum configured: existing v0.6 behavior.
+            # May skip WARNING and/or GRACE if we were down - transition through them.
             return await self._transition_through(Status.WARNING, Status.GRACE, Status.TRIGGERED)
 
         return None

@@ -77,18 +77,6 @@ class ScheduledItem:
 
 
 @dataclass
-class QuorumConfig:
-    """Quorum requirements for triggering (v0.7).
-
-    When set on a Config, the watchdog will not transition to TRIGGERED
-    on its own. Instead it broadcasts an intent and requires `required`
-    confirmations from peers (counting self) within `window_seconds`.
-    """
-    required: int = 1
-    window_seconds: int = 30
-
-
-@dataclass
 class Config:
     """Main configuration for a Posthumous node."""
 
@@ -131,14 +119,6 @@ class Config:
     # Peer health monitoring
     peer_check_interval: timedelta = field(default_factory=lambda: timedelta(minutes=30))
     peer_down_threshold: timedelta = field(default_factory=lambda: timedelta(hours=6))
-
-    # Quorum (v0.7)
-    quorum: QuorumConfig | None = None
-
-    # Canonical identity URL used in quorum bundles. If unset, falls back to
-    # the listen address. Required when listen is a wildcard (0.0.0.0) and
-    # quorum is enabled, because peers must know this node by a routable URL.
-    public_url: str | None = None
 
     # Base URL for constructing check-in/dashboard links in notifications
     base_url: str | None = None
@@ -227,15 +207,6 @@ class Config:
         # Parse actions from nested structure
         actions_config = data.get('actions', {})
 
-        # Parse optional quorum block (v0.7)
-        quorum_data = data.get('quorum')
-        quorum = None
-        if quorum_data is not None:
-            quorum = QuorumConfig(
-                required=quorum_data.get('required', 1),
-                window_seconds=quorum_data.get('window_seconds', 30),
-            )
-
         return cls(
             node_name=data['node_name'],
             secret_key=data['secret_key'],
@@ -257,8 +228,6 @@ class Config:
             check_interval=parse_duration(data['check_interval']) if 'check_interval' in data else None,
             peer_check_interval=get_duration('peer_check_interval', timedelta(minutes=30)),
             peer_down_threshold=get_duration('peer_down_threshold', timedelta(hours=6)),
-            quorum=quorum,
-            public_url=data.get('public_url'),
             base_url=data.get('base_url'),
             encrypt_at_rest=data.get('encrypt_at_rest', False),
             config_dir=config_dir,
@@ -357,15 +326,6 @@ class Config:
         if self.encrypt_at_rest:
             data['encrypt_at_rest'] = True
 
-        if self.quorum is not None:
-            data['quorum'] = {
-                'required': self.quorum.required,
-                'window_seconds': self.quorum.window_seconds,
-            }
-
-        if self.public_url:
-            data['public_url'] = self.public_url
-
         return data
 
     def save(self, path: Path | str | None = None) -> None:
@@ -402,16 +362,6 @@ class Config:
         host = self.listen.replace('0.0.0.0', 'localhost')
         return f"http://{host}"
 
-    def self_url(self) -> str:
-        """Canonical identity URL used in quorum confirmations and peer lookups.
-
-        Returns public_url if set (with trailing slash stripped), otherwise
-        falls back to the listen address. This URL must match what other peers
-        list in their `peers:` config for quorum bundle verification to succeed.
-        """
-        if self.public_url:
-            return self.public_url.rstrip('/')
-        return self.listen if self.listen.startswith("http") else f"http://{self.listen}"
 
     def get_encryption_secret(self) -> str | None:
         """Get the encryption secret for state files, or None if encryption is disabled.
@@ -475,33 +425,6 @@ class Config:
                 errors.append(
                     f"Scheduled item '{item.name}' references unknown channel: {item.notify}"
                 )
-
-        # Quorum validation (v0.7)
-        if self.quorum is not None:
-            if self.quorum.required < 1:
-                errors.append(f"quorum.required must be >= 1, got {self.quorum.required}")
-            federation_size = len(self.peers) + 1  # +1 for self
-            if self.quorum.required > federation_size:
-                errors.append(
-                    f"quorum.required ({self.quorum.required}) exceeds federation size ({federation_size})"
-                )
-            if self.quorum.window_seconds <= 0:
-                errors.append(f"quorum.window_seconds must be > 0, got {self.quorum.window_seconds}")
-
-            # When listen is a wildcard, the listen-derived self_url cannot
-            # match anything in another peer's `peers:` config. Require an
-            # explicit public_url so peers can verify our signed confirmations.
-            listen_host = self.listen.split(':')[0] if ':' in self.listen else self.listen
-            if listen_host in ('0.0.0.0', '[::]', '::') and not self.public_url:
-                errors.append(
-                    "public_url is required when quorum is enabled and listen binds a "
-                    "wildcard address (got listen='{}')".format(self.listen)
-                )
-
-        # public_url shape (independent of quorum)
-        if self.public_url is not None:
-            if not self.public_url.startswith(('http://', 'https://')):
-                errors.append("public_url must start with http:// or https://")
 
         return errors
 

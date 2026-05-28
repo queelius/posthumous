@@ -6,7 +6,8 @@ A lightweight, federated deadman switch. Users check in periodically via TOTP; i
 
 - **TOTP authentication**: Works with any authenticator app (Google Authenticator, Authy, etc.)
 - **Federated**: Multiple nodes sync check-ins; any single node can trigger (failure mode: duplicates, not silence)
-- **Quorum-based triggering** (optional, v0.7+): Require M-of-N peer confirmation before triggering, so a single compromised peer cannot fire the deadman switch alone
+- **Suppression-resistant** (v0.8): each node fires independently; a returning offline node merges peer state on startup to avoid false alarms from stale data
+- **CLI routes through the daemon**: `phm checkin` POSTs to the running daemon when available, falls back to direct write + broadcast otherwise; no split-brain
 - **Self-healing**: Nodes auto-recover state from peers on startup if their local state is corrupt or missing
 - **Multi-stage escalation**: Configurable warning → grace → trigger pipeline with callbacks at each stage
 - **Post-trigger scheduling**: Recurring actions after trigger, such as annual emails, birthday messages, and periodic scripts
@@ -516,30 +517,28 @@ All peer sync messages are signed with HMAC-SHA256 using the shared `secret_key`
 signature = HMAC-SHA256(secret_key, "checkin:<timestamp>")
 signature = HMAC-SHA256(secret_key, "trigger:<timestamp>")
 signature = HMAC-SHA256(secret_key, "scheduled:<item_name>:<period>")
-signature = HMAC-SHA256(secret_key, "trigger_intent:<intent_id>:<timestamp>")
-signature = HMAC-SHA256(secret_key, "confirm:<intent_id>:<timestamp>:<peer_url>")
 ```
 
-### Quorum (opt-in, v0.7+)
+### Startup peer-state pull (v0.8)
 
-By default, any single node can broadcast a trigger and all peers apply it. Quorum changes this: a node that decides to trigger first broadcasts an intent, collects signed confirmations from peers, and only applies the trigger when at least `required` confirmations (including self) arrive within `window_seconds`.
+A returning offline node would otherwise read its last-known `last_checkin` from disk and may fire WARNING / GRACE / TRIGGER prematurely from stale data. v0.8 changes startup behavior: before the watchdog starts, the daemon queries each peer's `/sync/state` and merges:
 
-```yaml
-quorum:
-  required: 2            # M: minimum confirmations including self
-  window_seconds: 30     # how long to wait for peer confirmations
+- `last_checkin`: adopt the newest seen across self and all peers.
+- `status` and `trigger_time`: if any peer is TRIGGERED, adopt TRIGGERED (federation bias: do not drop a trigger that fired while we were offline).
+- `schedule_state`: union of completed period_keys (no double-runs of scheduled items).
 
-# Required when `listen` binds a wildcard (0.0.0.0). Every other peer must
-# list this URL in their `peers:` block; it is the canonical identity used
-# in signed quorum confirmations.
-public_url: https://this-node.example.com:8420
-```
+Unreachable peers are silently skipped. If no peers are configured, the local state is trusted as-is.
 
-`public_url` exists because the signed identity in a quorum confirmation must match what other peers know this node by. If you listen on `0.0.0.0:8420`, the listen value cannot be a peer URL anywhere; set `public_url` explicitly so peers can verify your signatures. When `listen` is a routable hostname/IP that peers already use (e.g. `node.example.com:8420`), `public_url` is optional and the listen value is used as the canonical identity.
+### CLI checkin routing (v0.8)
 
-Peers vote `confirm` only if their own local timer has also elapsed, so quorum genuinely requires independent agreement across peers. If quorum fails (partition, disagreement), the node stays in `GRACE` and retries on the next tick. This is a **fail-closed** design: stuck without a trigger is preferred to a trigger from a single compromised host.
+`phm checkin` now prefers the running daemon's HTTP endpoint:
 
-**Known limitation (see Security below):** because all nodes share the same HMAC secret, an attacker who obtains the secret can assemble a quorum bundle without actually compromising M peers. v0.7 quorum raises the bar against specific compromise paths (a single rogue peer cannot unilaterally trigger) but does not provide true Byzantine fault tolerance. Planned for v0.8: per-peer identity keys.
+1. POST to `http://<config.listen>/checkin` with the TOTP code / token.
+2. On a 200 response, the daemon has handled auth, state mutation, and peer broadcast.
+3. On 4xx/5xx, the daemon's error is surfaced and the CLI exits 1.
+4. On connection refused (daemon not running), the CLI falls back to a direct state write plus a one-shot peer broadcast.
+
+This eliminates the split-brain that the pre-v0.8 CLI could cause when the daemon was running but the CLI wrote to `state.yaml` directly.
 
 ## Security
 
@@ -561,14 +560,19 @@ All peer communication is signed with the shared TOTP secret using HMAC-SHA256. 
 
 ### Threat Model and Known Limitations
 
-Posthumous's security boundaries:
+Posthumous is designed for the personal deadman-switch use case where **suppression** (the trigger fails to fire) is the existential failure mode and **forgery** (a false trigger) is annoying but recoverable. The design optimizes accordingly: any single node can fire the trigger, federation provides redundancy, and a returning offline node merges peer state on startup rather than refusing to participate.
+
+What Posthumous protects against:
 
 - **Unauthenticated network attackers** cannot trigger the deadman switch. All sync endpoints verify HMAC signatures using the shared secret. Messages older than 5 minutes are rejected (replay protection).
-- **A single compromised peer** *without quorum configured* CAN trigger the entire federation. With quorum enabled, a single compromised peer without the shared secret cannot.
-- **An attacker who obtains the shared `secret_key`** can currently forge arbitrary sync messages, including quorum-confirmed trigger bundles. Quorum's "M-of-N must agree" guarantee assumes the secret is not compromised. This is a consequence of using a single shared HMAC secret across all federation members.
 - **State at rest** is optionally encrypted (`encrypt_at_rest: true`) using PBKDF2-HMAC-SHA256 key derivation with per-file random salts. The encryption key is derived from the shared secret.
 
-Planned for v0.8: per-peer signing keys so that forging a quorum bundle genuinely requires compromising M peers, not just one secret holder.
+What Posthumous does NOT protect against:
+
+- **A compromised peer** can trigger the entire federation. The shared `secret_key` means any peer with the secret can sign valid trigger broadcasts. If you need defense against insider compromise, Posthumous is not the tool for you today; a per-peer-identity design is a future direction.
+- **All-node failure**: if every node in your federation dies simultaneously (catastrophic hosting failure, network partition, etc.), no trigger fires. Geographic and provider diversity mitigates this. Loud `on_peer_down` notifications (with `{healthy_peers}/{total_peers}` template variables) help you notice federation degradation in time to add or replace nodes.
+
+Prior versions (v0.7.x) shipped an optional quorum protocol intended to defend against single-peer compromise; it was removed in v0.8 because the shared-secret model meant it never delivered its M-of-N security claim, and its fail-closed semantics worked against the more important suppression-resistance property. If you need quorum semantics, pin to v0.7.2.
 
 ## CLI Reference
 

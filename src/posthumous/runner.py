@@ -20,7 +20,6 @@ from posthumous.auth import Authenticator
 from posthumous.config import Config, NotificationAction, ScriptAction
 from posthumous.notifications import NotificationManager, build_context
 from posthumous.peers import PeerManager
-from posthumous.quorum import QuorumCoordinator
 from posthumous.scheduler import Scheduler, ScheduledExecution
 from posthumous.scripts import ScriptContext, ScriptRunner
 from posthumous.server import Server
@@ -53,17 +52,24 @@ class DaemonRunner:
         self.script_runner: ScriptRunner | None = None
         self.authenticator: Authenticator | None = None
         self.peer_manager: PeerManager | None = None
-        self.quorum_coordinator: QuorumCoordinator | None = None
         self.watchdog: Watchdog | None = None
         self.scheduler: Scheduler | None = None
         self.server: Server | None = None
         self._stop_event: asyncio.Event | None = None
 
     async def attempt_state_recovery(self) -> None:
-        """If the state file is corrupt, try to recover from peers.
+        """Reconcile local state with peers before components are built.
 
-        Does nothing if state is valid or missing. Idempotent - safe to call
-        before components are constructed.
+        Two paths:
+
+        1. State file is corrupt: full recovery from the healthiest peer
+           (overwrite semantics).
+        2. State file is valid: merge peer state into local state, adopting
+           the newest last_checkin, any peer's TRIGGERED status, and the
+           union of completed schedule periods. Closes the stale-state
+           false-alarm window for a node returning from being offline.
+
+        Idempotent. Never raises: peer-side errors are logged and skipped.
         """
         state_path = self.config.config_dir / "state.yaml"
         encryption_secret = self.config.get_encryption_secret()
@@ -73,24 +79,35 @@ class DaemonRunner:
 
         try:
             State.load(state_path, encryption_secret)
+            state_is_corrupt = False
         except StateCorruptError:
-            logger.warning("State file is corrupt, attempting peer recovery...")
-            temp_manager = StateManager(state_path, encryption_secret)
-            temp_peer = PeerManager(self.config, temp_manager)
-            try:
+            state_is_corrupt = True
+
+        if not self.config.peers:
+            # Nothing to sync against. A corrupt state with no peers means we
+            # start fresh anyway; a valid state with no peers means trust disk.
+            if state_is_corrupt:
+                logger.warning("State corrupt and no peers configured; starting fresh")
+            return
+
+        temp_manager = StateManager(state_path, encryption_secret)
+        temp_peer = PeerManager(self.config, temp_manager)
+        try:
+            if state_is_corrupt:
+                logger.warning("State file is corrupt, attempting peer recovery...")
                 recovered = await temp_peer.sync_state_from_peers()
                 if recovered:
                     logger.info("State recovered from peer")
                 else:
-                    logger.warning(
-                        "No peers available, starting with fresh state"
-                    )
-            except Exception as e:
-                logger.warning(
-                    f"Peer recovery failed: {e}, starting with fresh state"
-                )
-            finally:
-                await temp_peer.close()
+                    logger.warning("Peer recovery failed; starting with fresh state")
+            else:
+                # Valid state: merge peer state in to catch up on any
+                # check-ins / triggers we missed while offline.
+                await temp_peer.merge_state_from_peers()
+        except Exception as e:
+            logger.warning(f"Peer state reconciliation failed: {e}")
+        finally:
+            await temp_peer.close()
 
     def build_components(self) -> None:
         """Instantiate all components. Called after optional state recovery."""
@@ -117,12 +134,6 @@ class DaemonRunner:
             on_peer_down=self.on_peer_down,
         )
 
-        # Quorum coordinator is only built if quorum is configured (v0.7).
-        if self.config.quorum is not None:
-            self.quorum_coordinator = QuorumCoordinator(
-                self.config, self.state_manager, self.peer_manager
-            )
-
         # Watchdog fires on_warning / on_grace / on_trigger as state transitions
         self.watchdog = Watchdog(
             config,
@@ -130,7 +141,6 @@ class DaemonRunner:
             on_warning=self.on_warning,
             on_grace=self.on_grace,
             on_trigger=self.on_trigger,
-            quorum_coordinator=self.quorum_coordinator,
         )
 
         # Scheduler fires on_scheduled_complete after each scheduled action
@@ -175,6 +185,9 @@ class DaemonRunner:
             trigger_time=trigger_time,
             trigger_at=config.trigger_at,
             base_url=config.get_base_url(),
+            peer_urls=config.peers,
+            peer_states=self.state_manager.state.peer_states,
+            peer_down_threshold=config.peer_down_threshold,
         )
         if extra_context:
             context.update(extra_context)

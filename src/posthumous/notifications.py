@@ -207,6 +207,9 @@ def build_context(
     trigger_time: datetime | None = None,
     trigger_at: timedelta | None = None,
     base_url: str | None = None,
+    peer_urls: list[str] | None = None,
+    peer_states: dict | None = None,
+    peer_down_threshold: timedelta | None = None,
 ) -> dict[str, Any]:
     """Build a context dictionary for message formatting.
 
@@ -217,6 +220,9 @@ def build_context(
         trigger_time: When trigger occurred (if triggered)
         trigger_at: Duration from checkin to trigger
         base_url: Base URL for constructing check-in/dashboard links
+        peer_urls: Configured peer URLs (for federation health vars)
+        peer_states: dict[str, PeerState] tracking observed peer status
+        peer_down_threshold: Threshold for considering a peer dead
 
     Returns:
         Context dictionary with formatted values
@@ -249,6 +255,26 @@ def build_context(
         context["base_url"] = url
         context["checkin_url"] = f"{url}/checkin"
         context["dashboard_url"] = f"{url}/dashboard"
+
+    # Federation health: count healthy vs dead peers so users can write
+    # loud degradation alerts ("federation at {healthy_peers}/{total_peers}").
+    if peer_urls is not None:
+        total = len(peer_urls)
+        healthy = 0
+        if peer_states is not None:
+            threshold = peer_down_threshold or timedelta(hours=6)
+            for url in peer_urls:
+                ps = peer_states.get(url)
+                if ps is None or ps.last_seen is None:
+                    continue
+                if ps.consecutive_failures > 0:
+                    continue
+                if (now - ps.last_seen) > threshold:
+                    continue
+                healthy += 1
+        context["total_peers"] = total
+        context["healthy_peers"] = healthy
+        context["dead_peers"] = total - healthy
 
     return context
 

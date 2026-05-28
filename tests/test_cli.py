@@ -1525,3 +1525,60 @@ class TestRecover:
 
             assert result.exit_code == 0
             assert "No reachable peers" in result.output
+
+
+class TestCheckinRouting:
+    """v0.8 CLI checkin: prefers running daemon, falls back to direct."""
+
+    def test_routes_through_running_daemon(self, runner, config_path):
+        """If the daemon answers, the CLI uses its response and skips direct state work."""
+        code = pyotp.TOTP(SECRET, issuer="Posthumous").now()
+
+        daemon_payload = {
+            "success": True,
+            "status": "armed",
+            "next_deadline": "2026-06-04T12:00:00+00:00",
+        }
+
+        with patch('posthumous.cli._try_daemon_checkin', return_value=daemon_payload):
+            result = runner.invoke(
+                main, ['-c', str(config_path), 'checkin'],
+                input=f"{code}\n",
+            )
+
+        assert result.exit_code == 0
+        assert "via daemon" in result.output
+        assert "ARMED" in result.output
+        assert "2026-06-04" in result.output
+
+    def test_falls_back_when_daemon_unreachable(self, runner, config_path):
+        """Connection refused (None return) falls back to direct + broadcast."""
+        code = pyotp.TOTP(SECRET, issuer="Posthumous").now()
+
+        with patch('posthumous.cli._try_daemon_checkin', return_value=None):
+            result = runner.invoke(
+                main, ['-c', str(config_path), 'checkin'],
+                input=f"{code}\n",
+            )
+
+        assert result.exit_code == 0
+        assert "Daemon not running" in result.output
+        assert "(direct)" in result.output
+        assert "ARMED" in result.output
+
+    def test_daemon_error_surfaces_clearly(self, runner, config_path):
+        """A 4xx from the daemon (str return) is surfaced and exits non-zero."""
+        code = pyotp.TOTP(SECRET, issuer="Posthumous").now()
+
+        with patch(
+            'posthumous.cli._try_daemon_checkin',
+            return_value="Locked out for 5 minutes",
+        ):
+            result = runner.invoke(
+                main, ['-c', str(config_path), 'checkin'],
+                input=f"{code}\n",
+            )
+
+        assert result.exit_code == 1
+        assert "Daemon rejected check-in" in result.output
+        assert "Locked out" in result.output

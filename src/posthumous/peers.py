@@ -191,65 +191,20 @@ class PeerManager:
             update_peer_state=True,
         )
 
-    async def broadcast_trigger(
-        self,
-        timestamp: datetime,
-        intent_id: str | None = None,
-        intent_timestamp: str | None = None,
-        confirmations: list | None = None,  # list[Confirmation] when v0.7 quorum is in use
-    ) -> dict[str, bool]:
-        """Broadcast trigger event to all peers.
-
-        v0.6 mode: pass only `timestamp`. The trigger is accepted by peers
-        based on the outer HMAC signature.
-
-        v0.7 mode: pass `intent_id`, `intent_timestamp`, and `confirmations`.
-        The bundle is attached so each peer can independently verify quorum.
-        """
+    async def broadcast_trigger(self, timestamp: datetime) -> dict[str, bool]:
+        """Broadcast a trigger event to all peers. Outer HMAC over the timestamp."""
         timestamp_str = timestamp.isoformat()
         signature = sign_message(self.config.secret_key, f"trigger:{timestamp_str}")
 
-        payload: dict = {
-            "event": "triggered",
-            "timestamp": timestamp_str,
-            "signature": signature,
-            "node": self.config.node_name,
-        }
-
-        if intent_id is not None and confirmations is not None:
-            payload["intent_id"] = intent_id
-            payload["intent_timestamp"] = intent_timestamp
-            payload["confirmations"] = [
-                {"peer_url": c.peer_url, "signature": c.signature} for c in confirmations
-            ]
-
-        return await self._broadcast_to_all("sync/trigger", payload)
-
-    async def broadcast_trigger_intent(self, intent_payload: dict) -> dict[str, dict]:
-        """Broadcast an intent to all peers and collect their vote responses.
-
-        Unlike other broadcasts, we want the response body (the vote), not
-        just success/failure. Returns a dict mapping peer_url -> response dict.
-        Peers that returned non-200/409 or errored are absent from the result.
-        """
-        if not self.config.peers:
-            return {}
-
-        async def post_and_parse(peer_url: str) -> tuple[str, dict | None]:
-            url = f"{peer_url.rstrip('/')}/sync/trigger_intent"
-            try:
-                session = await self._get_session()
-                async with session.post(url, json=intent_payload) as response:
-                    if response.status in (200, 409):
-                        return peer_url, await response.json()
-                    return peer_url, None
-            except Exception as e:
-                logger.debug(f"intent broadcast to {peer_url} failed: {e}")
-                return peer_url, None
-
-        tasks = [post_and_parse(url) for url in self.config.peers]
-        results = await asyncio.gather(*tasks)
-        return {url: resp for url, resp in results if resp is not None}
+        return await self._broadcast_to_all(
+            "sync/trigger",
+            {
+                "event": "triggered",
+                "timestamp": timestamp_str,
+                "signature": signature,
+                "node": self.config.node_name,
+            },
+        )
 
     async def broadcast_scheduled_complete(
         self,
@@ -316,6 +271,109 @@ class PeerManager:
 
         tasks = [self.get_peer_status(url) for url in self.config.peers]
         return await asyncio.gather(*tasks)
+
+    async def merge_state_from_peers(self) -> dict[str, str]:
+        """Pull state from all reachable peers and merge into local state.
+
+        Used on every startup (not just corrupt-state recovery) to close the
+        stale-state false-alarm window: a node returning from being offline
+        adopts peer state before the watchdog fires anything.
+
+        Merge rules:
+        - last_checkin: take max(local, all peers).
+        - status / trigger_time: if any peer is TRIGGERED, adopt TRIGGERED
+          with that peer's trigger_time (federation bias: don't drop triggers).
+        - schedule_state: union of completed period_keys across peers.
+
+        Returns a dict describing what changed (empty if nothing changed).
+        Never raises: peer-side errors are logged and skipped.
+        """
+        if not self.config.peers:
+            return {}
+
+        from posthumous.state import Status
+
+        statuses = await self.get_all_peer_status()
+        changes: dict[str, str] = {}
+        state = self.state_manager.state
+
+        # Collect full state from every reachable peer (in parallel).
+        async def fetch(peer_url: str) -> dict | None:
+            ts = datetime.now(timezone.utc).isoformat()
+            sig = sign_message(self.config.secret_key, f"state:{ts}")
+            data, error = await self._get(
+                peer_url, "sync/state", params={"ts": ts, "sig": sig}
+            )
+            if error or not isinstance(data, dict):
+                return None
+            return data
+
+        reachable = [s for s in statuses if s.reachable]
+        if not reachable:
+            return {}
+
+        peer_states = await asyncio.gather(
+            *(fetch(s.url) for s in reachable), return_exceptions=True
+        )
+        peer_states = [p for p in peer_states if isinstance(p, dict)]
+
+        # 1. Newest last_checkin wins.
+        best_checkin = state.last_checkin
+        for data in peer_states:
+            if not data.get("last_checkin"):
+                continue
+            try:
+                ts = datetime.fromisoformat(data["last_checkin"].replace('Z', '+00:00'))
+            except (ValueError, AttributeError):
+                continue
+            if best_checkin is None or ts > best_checkin:
+                best_checkin = ts
+        if best_checkin is not None and best_checkin != state.last_checkin:
+            changes["last_checkin"] = best_checkin.isoformat()
+            state.last_checkin = best_checkin
+
+        # 2. If any peer is TRIGGERED and we are not, adopt TRIGGERED.
+        if state.status != Status.TRIGGERED:
+            triggered_peers = [
+                p for p in peer_states if p.get("status") == Status.TRIGGERED.value
+            ]
+            if triggered_peers:
+                # Adopt the earliest peer trigger_time (closest to actual event).
+                trigger_times = []
+                for p in triggered_peers:
+                    if not p.get("trigger_time"):
+                        continue
+                    try:
+                        trigger_times.append(
+                            datetime.fromisoformat(p["trigger_time"].replace('Z', '+00:00'))
+                        )
+                    except (ValueError, AttributeError):
+                        continue
+                adopted = min(trigger_times) if trigger_times else datetime.now(timezone.utc)
+                # The state machine requires going through GRACE before TRIGGERED.
+                # Force the status field directly here: this is recovery, not a
+                # live transition, and we already know peers fired.
+                state.status = Status.TRIGGERED
+                state.trigger_time = adopted
+                changes["status"] = "triggered"
+                changes["trigger_time"] = adopted.isoformat()
+
+        # 3. Schedule state: union of completed period_keys.
+        for data in peer_states:
+            for name, item_data in (data.get("schedule_state") or {}).items():
+                period = item_data.get("period") if isinstance(item_data, dict) else None
+                if not period:
+                    continue
+                local_item = state.schedule_state.get(name)
+                if local_item is None or local_item.period != period:
+                    state.mark_schedule_item_run(name, period)
+                    changes.setdefault("schedule_state", "merged")
+
+        if changes:
+            self.state_manager.save()
+            logger.info(f"Merged state from peers: {changes}")
+
+        return changes
 
     async def sync_state_from_peers(
         self, statuses: list[PeerStatus] | None = None

@@ -36,7 +36,6 @@ class Status(Enum):
     ARMED = "armed"
     WARNING = "warning"
     GRACE = "grace"
-    PENDING_QUORUM = "pending_quorum"
     TRIGGERED = "triggered"
 
 
@@ -273,8 +272,7 @@ class State:
         valid_transitions = {
             Status.ARMED: {Status.WARNING},
             Status.WARNING: {Status.ARMED, Status.GRACE},
-            Status.GRACE: {Status.ARMED, Status.PENDING_QUORUM, Status.TRIGGERED},
-            Status.PENDING_QUORUM: {Status.ARMED, Status.GRACE, Status.TRIGGERED},
+            Status.GRACE: {Status.ARMED, Status.TRIGGERED},
             Status.TRIGGERED: set(),  # No transitions out of TRIGGERED
         }
 

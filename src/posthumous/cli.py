@@ -408,16 +408,82 @@ def run(ctx: click.Context, daemon: bool, stop: bool) -> None:
         pass
 
 
+def _try_daemon_checkin(config, totp: str | None, token: str | None) -> dict | str | None:
+    """POST to the local daemon's /checkin endpoint.
+
+    Returns:
+    - dict with the daemon's JSON response on success,
+    - str error message if the daemon answered with a 4xx/5xx,
+    - None if the daemon is unreachable (caller should fall back).
+    """
+    import json
+    import urllib.error
+    import urllib.request
+
+    listen_host = config.listen.replace('0.0.0.0', '127.0.0.1')
+    url = f"http://{listen_host}/checkin"
+    payload = json.dumps({"totp": totp, "token": token}).encode()
+    req = urllib.request.Request(
+        url, data=payload,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read())
+            return body.get("error", f"HTTP {e.code}")
+        except Exception:
+            return f"HTTP {e.code}"
+    except (urllib.error.URLError, ConnectionError, OSError):
+        return None
+
+
 @main.command()
 @click.option('--token', '-t', help='Use API token instead of TOTP')
 @click.pass_context
 def checkin(ctx: click.Context, token: str | None) -> None:
-    """Check in to reset the timer."""
+    """Check in to reset the timer.
+
+    Routes through the local daemon's HTTP endpoint when running so the
+    daemon owns auth, state mutation, and peer broadcast. Falls back to a
+    direct state write plus a one-shot peer broadcast when the daemon is
+    not reachable.
+    """
     from posthumous.state import StateManager, Status
     from posthumous.auth import Authenticator, LockedOutError, AuthError
 
     _, config = _load_config_or_exit(ctx)
-    state_manager = StateManager(config.config_dir / "state.yaml", config.get_encryption_secret())
+
+    # Get TOTP code if no token provided
+    totp = None
+    if not token:
+        totp = click.prompt("TOTP code", hide_input=False)
+
+    # Path 1: try the running daemon
+    daemon_result = _try_daemon_checkin(config, totp, token)
+
+    if isinstance(daemon_result, dict):
+        # Daemon answered successfully
+        click.echo("✓ Check-in accepted (via daemon)")
+        if daemon_result.get("status"):
+            click.echo(f"  Status: {daemon_result['status'].upper()}")
+        if daemon_result.get("next_deadline"):
+            click.echo(f"  Next deadline: {daemon_result['next_deadline']}")
+        return
+
+    if isinstance(daemon_result, str):
+        # Daemon answered with an error (auth failed, locked out, triggered)
+        click.echo(f"Daemon rejected check-in: {daemon_result}", err=True)
+        sys.exit(1)
+
+    # Path 2: daemon unreachable, fall back to direct
+    click.echo("Daemon not running, checking in directly.", err=True)
+
+    state_manager = StateManager(
+        config.config_dir / "state.yaml", config.get_encryption_secret()
+    )
 
     if state_manager.state.status == Status.TRIGGERED:
         click.echo("Node is already TRIGGERED. Check-in not possible.", err=True)
@@ -430,17 +496,10 @@ def checkin(ctx: click.Context, token: str | None) -> None:
         lockout_duration=config.lockout_duration,
     )
 
-    # Get code
-    code = None
-    if not token:
-        code = click.prompt("TOTP code", hide_input=False)
-
     try:
         success = authenticator.verify(
-            code=code,
-            token=token,
-            state=state_manager.state,
-            source="cli",
+            code=totp, token=token,
+            state=state_manager.state, source="cli",
         )
     except LockedOutError as e:
         state_manager.save()
@@ -455,13 +514,30 @@ def checkin(ctx: click.Context, token: str | None) -> None:
         click.echo("Invalid code.", err=True)
         sys.exit(1)
 
-    # Record check-in
     state_manager.checkin()
 
-    # Calculate next deadline
-    next_deadline = state_manager.state.last_checkin + config.trigger_at
+    # Broadcast to peers so they learn about this checkin even though
+    # no daemon is running locally to do it.
+    if config.peers:
+        import asyncio
+        from posthumous.peers import PeerManager
 
-    click.echo(f"✓ Check-in accepted")
+        async def _broadcast():
+            pm = PeerManager(config, state_manager)
+            try:
+                results = await pm.broadcast_checkin(state_manager.state.last_checkin)
+                ok = sum(1 for v in results.values() if v)
+                click.echo(f"  Broadcast to {ok}/{len(results)} peers")
+            finally:
+                await pm.close()
+
+        try:
+            asyncio.run(_broadcast())
+        except Exception as e:
+            click.echo(f"  (peer broadcast failed: {e})", err=True)
+
+    next_deadline = state_manager.state.last_checkin + config.trigger_at
+    click.echo("✓ Check-in accepted (direct)")
     click.echo(f"  Status: {state_manager.state.status.value.upper()}")
     click.echo(f"  Next deadline: {next_deadline.strftime('%Y-%m-%d %H:%M UTC')}")
 
