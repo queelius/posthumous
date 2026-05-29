@@ -18,11 +18,18 @@ SECRET = "JBSWY3DPEHPK3PXP"
 
 @pytest.fixture
 def config():
-    """Create a test configuration."""
+    """Create a test configuration.
+
+    Uses listen='127.0.0.1:0' so any test that actually calls Server.start()
+    binds to an OS-assigned ephemeral port. Tests that use TestClient (most of
+    this module) ignore config.listen entirely. The few that bind for real
+    (test_server_start_stop_lifecycle, test_server_stop_when_not_started) used
+    to flake under port-8420 contention; ephemeral binding fixes that.
+    """
     return Config(
         node_name="test-node",
         secret_key=SECRET,
-        listen="127.0.0.1:8420",
+        listen="127.0.0.1:0",
         checkin_interval=timedelta(days=7),
         warning_start=timedelta(days=8),
         grace_start=timedelta(days=12),

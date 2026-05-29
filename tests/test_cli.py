@@ -1229,7 +1229,7 @@ class TestAutoRecovery:
         config_path.write_text(
             "node_name: test-node\n"
             f"secret_key: {SECRET}\n"
-            "listen: '127.0.0.1:8420'\n"
+            "listen: '127.0.0.1:0'\n"  # ephemeral: avoid binding conflicts
             "checkin_interval: 7 days\n"
             "warning_start: 8 days\n"
             "grace_start: 12 days\n"
@@ -1245,100 +1245,75 @@ class TestAutoRecovery:
         return config_dir
 
     def test_corrupt_state_triggers_peer_recovery(self, runner, config_dir_with_corrupt_state):
-        """When state file is corrupt, the run command should attempt peer recovery
-        before constructing the main StateManager."""
-        config_path = config_dir_with_corrupt_state / "config.yaml"
+        """A corrupt state file triggers peer recovery before the daemon lifecycle starts.
 
-        # Track what coroutines are passed to asyncio.run
-        recovery_ran = False
+        Strategy: patch PeerManager methods on the real class so the temp PeerManager
+        in `attempt_state_recovery` picks up our mock, and patch `asyncio.Event.wait`
+        so the daemon's stop_event returns immediately and the lifecycle completes.
+        """
+        config_path = config_dir_with_corrupt_state / "config.yaml"
 
         with patch('posthumous.peers.PeerManager.sync_state_from_peers',
                    new_callable=AsyncMock, return_value=True) as mock_sync, \
-             patch('posthumous.peers.PeerManager.close',
-                   new_callable=AsyncMock) as mock_close, \
-             patch('posthumous.cli.asyncio.run') as mock_asyncio_run:
-
-            def run_side_effect(coro):
-                nonlocal recovery_ran
-                # Run coroutines with a fresh event loop so mocks are exercised
-                loop = asyncio.new_event_loop()
-                try:
-                    result = loop.run_until_complete(coro)
-                    recovery_ran = True
-                    return result
-                except KeyboardInterrupt:
-                    pass
-                finally:
-                    loop.close()
-
-            mock_asyncio_run.side_effect = run_side_effect
-
+             patch('posthumous.peers.PeerManager.close', new_callable=AsyncMock), \
+             patch('posthumous.peers.PeerManager.merge_state_from_peers',
+                   new_callable=AsyncMock, return_value={}), \
+             patch('posthumous.peers.PeerManager.start_health_monitoring'), \
+             patch('posthumous.peers.PeerManager.stop_health_monitoring',
+                   new_callable=AsyncMock), \
+             patch('asyncio.Event.wait', new_callable=AsyncMock):
             result = runner.invoke(
                 main, ['-c', str(config_path), 'run'],
             )
 
-            assert recovery_ran
-            mock_sync.assert_called_once()
+        assert result.exit_code == 0, result.output
+        mock_sync.assert_called_once()
 
     def test_corrupt_state_recovery_failure_continues(self, runner, config_dir_with_corrupt_state):
-        """When peer recovery fails, the run command should continue with fresh state."""
+        """If peer recovery returns False, the daemon still proceeds (fresh state)."""
         config_path = config_dir_with_corrupt_state / "config.yaml"
 
         with patch('posthumous.peers.PeerManager.sync_state_from_peers',
                    new_callable=AsyncMock, return_value=False) as mock_sync, \
-             patch('posthumous.peers.PeerManager.close',
-                   new_callable=AsyncMock) as mock_close, \
-             patch('posthumous.cli.asyncio.run') as mock_asyncio_run:
-
-            def run_side_effect(coro):
-                loop = asyncio.new_event_loop()
-                try:
-                    return loop.run_until_complete(coro)
-                except KeyboardInterrupt:
-                    pass
-                finally:
-                    loop.close()
-
-            mock_asyncio_run.side_effect = run_side_effect
-
+             patch('posthumous.peers.PeerManager.close', new_callable=AsyncMock), \
+             patch('posthumous.peers.PeerManager.merge_state_from_peers',
+                   new_callable=AsyncMock, return_value={}), \
+             patch('posthumous.peers.PeerManager.start_health_monitoring'), \
+             patch('posthumous.peers.PeerManager.stop_health_monitoring',
+                   new_callable=AsyncMock), \
+             patch('asyncio.Event.wait', new_callable=AsyncMock):
             result = runner.invoke(
                 main, ['-c', str(config_path), 'run'],
             )
 
-            # Recovery was attempted but failed - should still proceed
-            mock_sync.assert_called_once()
+        assert result.exit_code == 0, result.output
+        mock_sync.assert_called_once()
 
     def test_corrupt_state_recovery_exception_continues(self, runner, config_dir_with_corrupt_state):
-        """When peer recovery raises an exception, the run command should continue."""
+        """If peer recovery raises, the exception is caught and the daemon proceeds."""
         config_path = config_dir_with_corrupt_state / "config.yaml"
 
         with patch('posthumous.peers.PeerManager.sync_state_from_peers',
                    new_callable=AsyncMock,
                    side_effect=Exception("Network error")) as mock_sync, \
-             patch('posthumous.peers.PeerManager.close',
-                   new_callable=AsyncMock) as mock_close, \
-             patch('posthumous.cli.asyncio.run') as mock_asyncio_run:
-
-            def run_side_effect(coro):
-                loop = asyncio.new_event_loop()
-                try:
-                    return loop.run_until_complete(coro)
-                except KeyboardInterrupt:
-                    pass
-                finally:
-                    loop.close()
-
-            mock_asyncio_run.side_effect = run_side_effect
-
+             patch('posthumous.peers.PeerManager.close', new_callable=AsyncMock), \
+             patch('posthumous.peers.PeerManager.merge_state_from_peers',
+                   new_callable=AsyncMock, return_value={}), \
+             patch('posthumous.peers.PeerManager.start_health_monitoring'), \
+             patch('posthumous.peers.PeerManager.stop_health_monitoring',
+                   new_callable=AsyncMock), \
+             patch('asyncio.Event.wait', new_callable=AsyncMock):
             result = runner.invoke(
                 main, ['-c', str(config_path), 'run'],
             )
 
-            # Recovery was attempted, exception was caught
-            mock_sync.assert_called_once()
+        assert result.exit_code == 0, result.output
+        mock_sync.assert_called_once()
 
-    def test_valid_state_skips_recovery(self, runner, tmp_path):
-        """When state file is valid, no recovery should be attempted."""
+    def test_valid_state_skips_full_recovery(self, runner, tmp_path):
+        """When state file is valid, the corrupt-state recovery branch (sync_state_from_peers)
+        is NOT called. The merge-on-startup path (merge_state_from_peers) IS called instead.
+        """
         config_dir = tmp_path / ".posthumous"
         config_dir.mkdir()
         (config_dir / "scripts").mkdir()
@@ -1348,7 +1323,7 @@ class TestAutoRecovery:
         config_path.write_text(
             "node_name: test-node\n"
             f"secret_key: {SECRET}\n"
-            "listen: '127.0.0.1:8420'\n"
+            "listen: '127.0.0.1:0'\n"  # ephemeral
             "checkin_interval: 7 days\n"
             "warning_start: 8 days\n"
             "grace_start: 12 days\n"
@@ -1364,25 +1339,22 @@ class TestAutoRecovery:
 
         with patch('posthumous.peers.PeerManager.sync_state_from_peers',
                    new_callable=AsyncMock) as mock_sync, \
-             patch('posthumous.cli.asyncio.run') as mock_asyncio_run:
-
-            def run_side_effect(coro):
-                loop = asyncio.new_event_loop()
-                try:
-                    return loop.run_until_complete(coro)
-                except KeyboardInterrupt:
-                    pass
-                finally:
-                    loop.close()
-
-            mock_asyncio_run.side_effect = run_side_effect
-
+             patch('posthumous.peers.PeerManager.merge_state_from_peers',
+                   new_callable=AsyncMock, return_value={}) as mock_merge, \
+             patch('posthumous.peers.PeerManager.close', new_callable=AsyncMock), \
+             patch('posthumous.peers.PeerManager.start_health_monitoring'), \
+             patch('posthumous.peers.PeerManager.stop_health_monitoring',
+                   new_callable=AsyncMock), \
+             patch('asyncio.Event.wait', new_callable=AsyncMock):
             result = runner.invoke(
                 main, ['-c', str(config_path), 'run'],
             )
 
-            # sync_state_from_peers should NOT have been called
-            mock_sync.assert_not_called()
+        assert result.exit_code == 0, result.output
+        # Corrupt-state recovery NOT triggered
+        mock_sync.assert_not_called()
+        # Merge-on-startup path WAS triggered (v0.8)
+        mock_merge.assert_called_once()
 
 
 class TestRecover:
