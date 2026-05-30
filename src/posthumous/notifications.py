@@ -259,22 +259,26 @@ def build_context(
     # Federation health: count healthy vs dead peers so users can write
     # loud degradation alerts ("federation at {healthy_peers}/{total_peers}").
     if peer_urls is not None:
-        total = len(peer_urls)
-        healthy = 0
-        if peer_states is not None:
-            threshold = peer_down_threshold or timedelta(hours=6)
-            for url in peer_urls:
-                ps = peer_states.get(url)
-                if ps is None or ps.last_seen is None:
-                    continue
-                if ps.consecutive_failures > 0:
-                    continue
-                if (now - ps.last_seen) > threshold:
-                    continue
-                healthy += 1
-        context["total_peers"] = total
+        threshold = peer_down_threshold or timedelta(hours=6)
+
+        def is_healthy(ps: Any) -> bool:
+            # "Dead" must mean the same thing the on_peer_down alert means:
+            # last successful contact is older than peer_down_threshold. We do
+            # NOT count a single transient probe failure (consecutive_failures
+            # > 0 but last_seen still recent) as dead, or {dead_peers} would
+            # flip on every blip and disagree with the alert that actually
+            # fired. A never-contacted peer (last_seen None) is not healthy.
+            return (
+                ps is not None
+                and ps.last_seen is not None
+                and (now - ps.last_seen) <= threshold
+            )
+
+        peer_states = peer_states or {}
+        healthy = sum(1 for url in peer_urls if is_healthy(peer_states.get(url)))
+        context["total_peers"] = len(peer_urls)
         context["healthy_peers"] = healthy
-        context["dead_peers"] = total - healthy
+        context["dead_peers"] = len(peer_urls) - healthy
 
     return context
 

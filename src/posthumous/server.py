@@ -223,7 +223,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 class Server:
     """HTTP server for check-ins and peer communication."""
 
-    SYNC_FRESHNESS_SECONDS = 300
+    # Replay-protection window for signed peer-sync messages. This is a
+    # deliberate suppression-vs-replay tradeoff: too tight and legitimate
+    # clock skew between federation nodes (a VPS without NTP, a Pi with no
+    # RTC, a host resumed from suspend) gets a fresh, validly-signed
+    # /sync/trigger or /sync/state rejected as "stale", silently suppressing
+    # trigger propagation. Since the messages are HMAC-signed, the only thing
+    # this window buys is bounding replay of a captured request; over the
+    # default cleartext transport an on-path attacker does not even need to
+    # replay. For a deadman switch, missing a real trigger is catastrophic and
+    # a wider replay window is cheap, so we err generous (15 minutes).
+    SYNC_FRESHNESS_SECONDS = 900
 
     def __init__(
         self,

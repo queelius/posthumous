@@ -564,7 +564,7 @@ Posthumous is designed for the personal deadman-switch use case where **suppress
 
 What Posthumous protects against:
 
-- **Unauthenticated network attackers** cannot trigger the deadman switch. All sync endpoints verify HMAC signatures using the shared secret. Messages older than 5 minutes are rejected (replay protection).
+- **Unauthenticated network attackers** cannot trigger the deadman switch. All sync endpoints verify HMAC signatures using the shared secret. Messages outside a 15-minute freshness window are rejected (replay protection). The window is deliberately generous: too tight and ordinary clock skew between nodes would reject a legitimately-signed trigger broadcast, silently suppressing it, which for a deadman switch is the worse failure.
 - **State at rest** is optionally encrypted (`encrypt_at_rest: true`) using PBKDF2-HMAC-SHA256 key derivation with per-file random salts. The encryption key is derived from the shared secret.
 
 What Posthumous does NOT protect against:

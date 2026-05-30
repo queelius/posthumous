@@ -273,7 +273,7 @@ class PeerManager:
         return await asyncio.gather(*tasks)
 
     async def merge_state_from_peers(self) -> dict[str, str]:
-        """Pull state from all reachable peers and merge into local state.
+        """Pull state from every peer and merge into local state.
 
         Used on every startup (not just corrupt-state recovery) to close the
         stale-state false-alarm window: a node returning from being offline
@@ -293,62 +293,66 @@ class PeerManager:
 
         from posthumous.state import Status
 
-        statuses = await self.get_all_peer_status()
-        changes: dict[str, str] = {}
-        state = self.state_manager.state
+        def parse_ts(value: object) -> datetime | None:
+            """Parse a peer-supplied ISO timestamp, or None if absent/malformed.
 
-        # Collect full state from every reachable peer (in parallel).
+            Returns None rather than raising so one bad peer payload cannot
+            abort the merge (suppression-resistance: we must never silently
+            drop a trigger because of a parse error elsewhere).
+            """
+            if not isinstance(value, str):
+                return None
+            try:
+                return datetime.fromisoformat(value.replace('Z', '+00:00'))
+            except ValueError:
+                return None
+
+        # Pull full state from every configured peer directly. We do NOT
+        # pre-probe /status first: fetch() already returns None for an
+        # unreachable peer, so the extra round-trip only doubled startup
+        # latency and the chance of a clock-skew rejection on the real call.
         async def fetch(peer_url: str) -> dict | None:
             ts = datetime.now(timezone.utc).isoformat()
             sig = sign_message(self.config.secret_key, f"state:{ts}")
             data, error = await self._get(
                 peer_url, "sync/state", params={"ts": ts, "sig": sig}
             )
-            if error or not isinstance(data, dict):
+            if error:
+                # Surface the skipped peer. A silent drop here (e.g. a
+                # clock-skew 401 from /sync/state) would mean a returning
+                # offline node fails to adopt a peer's TRIGGERED status,
+                # which is exactly the suppression this merge exists to stop.
+                logger.warning(f"State merge: skipping peer {peer_url}: {error}")
                 return None
-            return data
-
-        reachable = [s for s in statuses if s.reachable]
-        if not reachable:
-            return {}
+            return data if isinstance(data, dict) else None
 
         peer_states = await asyncio.gather(
-            *(fetch(s.url) for s in reachable), return_exceptions=True
+            *(fetch(url) for url in self.config.peers), return_exceptions=True
         )
         peer_states = [p for p in peer_states if isinstance(p, dict)]
 
+        changes: dict[str, str] = {}
+        state = self.state_manager.state
+
         # 1. Newest last_checkin wins.
-        best_checkin = state.last_checkin
-        for data in peer_states:
-            if not data.get("last_checkin"):
-                continue
-            try:
-                ts = datetime.fromisoformat(data["last_checkin"].replace('Z', '+00:00'))
-            except (ValueError, AttributeError):
-                continue
-            if best_checkin is None or ts > best_checkin:
-                best_checkin = ts
+        checkins = [parse_ts(p.get("last_checkin")) for p in peer_states]
+        candidates = [c for c in checkins if c is not None]
+        if state.last_checkin is not None:
+            candidates.append(state.last_checkin)
+        best_checkin = max(candidates) if candidates else None
         if best_checkin is not None and best_checkin != state.last_checkin:
-            changes["last_checkin"] = best_checkin.isoformat()
             state.last_checkin = best_checkin
+            changes["last_checkin"] = best_checkin.isoformat()
 
         # 2. If any peer is TRIGGERED and we are not, adopt TRIGGERED.
+        #    Adopt the earliest peer trigger_time (closest to the actual event).
         if state.status != Status.TRIGGERED:
             triggered_peers = [
                 p for p in peer_states if p.get("status") == Status.TRIGGERED.value
             ]
             if triggered_peers:
-                # Adopt the earliest peer trigger_time (closest to actual event).
-                trigger_times = []
-                for p in triggered_peers:
-                    if not p.get("trigger_time"):
-                        continue
-                    try:
-                        trigger_times.append(
-                            datetime.fromisoformat(p["trigger_time"].replace('Z', '+00:00'))
-                        )
-                    except (ValueError, AttributeError):
-                        continue
+                trigger_times = [parse_ts(p.get("trigger_time")) for p in triggered_peers]
+                trigger_times = [t for t in trigger_times if t is not None]
                 adopted = min(trigger_times) if trigger_times else datetime.now(timezone.utc)
                 # The state machine requires going through GRACE before TRIGGERED.
                 # Force the status field directly here: this is recovery, not a

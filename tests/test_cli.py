@@ -1554,3 +1554,24 @@ class TestCheckinRouting:
         assert result.exit_code == 1
         assert "Daemon rejected check-in" in result.output
         assert "Locked out" in result.output
+
+    def test_daemon_200_with_success_false_is_rejected(self, runner, config_path):
+        """A 200 body with success=false must NOT be reported as accepted.
+
+        Guards against the silent-suppression contract gap: HTTP status alone
+        is not trusted; the daemon's own success flag is authoritative.
+        """
+        code = pyotp.TOTP(SECRET, issuer="Posthumous").now()
+
+        with patch(
+            'posthumous.cli._try_daemon_checkin',
+            return_value={"success": False, "error": "node is triggered"},
+        ):
+            result = runner.invoke(
+                main, ['-c', str(config_path), 'checkin'],
+                input=f"{code}\n",
+            )
+
+        assert result.exit_code == 1
+        assert "accepted" not in result.output.lower()
+        assert "node is triggered" in result.output

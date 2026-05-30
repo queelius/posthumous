@@ -622,7 +622,8 @@ class TestSyncStateAuth:
 
     @pytest.mark.asyncio
     async def test_sync_state_rejects_stale_timestamp(self, client):
-        old_time = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        # >15min past now, beyond SYNC_FRESHNESS_SECONDS (900s)
+        old_time = (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat()
         signature = sign_message(SECRET, f"state:{old_time}")
         resp = await client.get("/sync/state", params={"ts": old_time, "sig": signature})
         assert resp.status == 401
@@ -1036,7 +1037,7 @@ class TestSyncReplayProtection:
     @pytest.mark.asyncio
     async def test_sync_checkin_rejects_stale_timestamp(self, client):
         """A checkin with a 10-minute-old timestamp should be rejected."""
-        stale_time = datetime.now(timezone.utc) - timedelta(minutes=10)
+        stale_time = datetime.now(timezone.utc) - timedelta(minutes=20)
         timestamp = stale_time.isoformat()
         message = f"checkin:{timestamp}"
         signature = sign_message(SECRET, message)
@@ -1071,7 +1072,7 @@ class TestSyncReplayProtection:
         """A trigger with a 10-minute-old timestamp should be rejected."""
         state_manager.state.status = Status.GRACE
 
-        stale_time = datetime.now(timezone.utc) - timedelta(minutes=10)
+        stale_time = datetime.now(timezone.utc) - timedelta(minutes=20)
         timestamp = stale_time.isoformat()
         message = f"trigger:{timestamp}"
         signature = sign_message(SECRET, message)
@@ -1090,7 +1091,7 @@ class TestSyncReplayProtection:
     @pytest.mark.asyncio
     async def test_sync_scheduled_rejects_stale_timestamp(self, client, state_manager):
         """A scheduled completion with a 10-minute-old timestamp should be rejected."""
-        stale_time = datetime.now(timezone.utc) - timedelta(minutes=10)
+        stale_time = datetime.now(timezone.utc) - timedelta(minutes=20)
         timestamp = stale_time.isoformat()
         item_name = "annual-backup"
         period = "2026"
@@ -1115,8 +1116,12 @@ class TestSyncReplayProtection:
 
     @pytest.mark.asyncio
     async def test_sync_checkin_rejects_future_timestamp(self, client):
-        """A checkin with a timestamp 10 minutes in the future should be rejected."""
-        future_time = datetime.now(timezone.utc) + timedelta(minutes=10)
+        """A checkin with a timestamp far in the future should be rejected.
+
+        Uses 20 minutes (> SYNC_FRESHNESS_SECONDS = 900s) so clock skew in the
+        forward direction is caught, mirroring the stale-past-timestamp tests.
+        """
+        future_time = datetime.now(timezone.utc) + timedelta(minutes=20)
         timestamp = future_time.isoformat()
         message = f"checkin:{timestamp}"
         signature = sign_message(SECRET, message)

@@ -1477,17 +1477,10 @@ class TestMergeStateFromPeers:
             "trigger_time": None,
             "schedule_state": {},
         }
-        peer_status_payload = {
-            "status": "armed", "last_checkin": peer_checkin.isoformat(),
-        }
 
         pm = PeerManager(config, state_manager)
         try:
             with aioresponses() as m:
-                m.get(
-                    "https://peer1.local:8420/status",
-                    payload=peer_status_payload, repeat=True,
-                )
                 m.get(
                     re.compile(r"https://peer1\.local:8420/sync/state"),
                     payload=peer_state_payload, repeat=True,
@@ -1515,15 +1508,10 @@ class TestMergeStateFromPeers:
             "trigger_time": peer_trigger_time.isoformat(),
             "schedule_state": {},
         }
-        peer_status_payload = {"status": "triggered", "last_checkin": None}
 
         pm = PeerManager(config, state_manager)
         try:
             with aioresponses() as m:
-                m.get(
-                    "https://peer1.local:8420/status",
-                    payload=peer_status_payload, repeat=True,
-                )
                 m.get(
                     re.compile(r"https://peer1\.local:8420/sync/state"),
                     payload=peer_state_payload, repeat=True,
@@ -1547,9 +1535,9 @@ class TestMergeStateFromPeers:
         pm = PeerManager(config, state_manager)
         try:
             with aioresponses() as m:
-                # status endpoint times out
+                # The state-sync endpoint is unreachable (merge calls it directly).
                 from aiohttp import ClientConnectionError
-                m.get("https://peer1.local:8420/status",
+                m.get(re.compile(r"https://peer1\.local:8420/sync/state"),
                       exception=ClientConnectionError("connection refused"),
                       repeat=True)
                 changes = await pm.merge_state_from_peers()
@@ -1577,16 +1565,10 @@ class TestMergeStateFromPeers:
                 "yearly_email": {"period": "2026", "last_run": "2026-01-01T00:00:00+00:00"},
             },
         }
-        peer_status_payload = {
-            "status": "armed",
-            "last_checkin": state_manager.state.last_checkin.isoformat(),
-        }
 
         pm = PeerManager(config, state_manager)
         try:
             with aioresponses() as m:
-                m.get("https://peer1.local:8420/status",
-                      payload=peer_status_payload, repeat=True)
                 m.get(re.compile(r"https://peer1\.local:8420/sync/state"),
                       payload=peer_state_payload, repeat=True)
                 await pm.merge_state_from_peers()

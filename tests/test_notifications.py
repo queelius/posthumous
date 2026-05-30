@@ -212,6 +212,106 @@ class TestBuildContext:
         assert "days left" in result
 
 
+class TestFederationHealthContext:
+    """Tests for the {healthy_peers}/{total_peers}/{dead_peers} context vars.
+
+    The "dead" definition must match the on_peer_down alert: a peer counts as
+    dead only once its last successful contact is older than peer_down_threshold.
+    """
+
+    def _peer_state(self, last_seen, consecutive_failures=0):
+        from posthumous.state import PeerState
+        return PeerState(
+            url="http://p:8420",
+            last_seen=last_seen,
+            consecutive_failures=consecutive_failures,
+        )
+
+    def test_no_peer_urls_omits_vars(self):
+        context = build_context(node_name="n", status="armed")
+        assert "total_peers" not in context
+        assert "healthy_peers" not in context
+        assert "dead_peers" not in context
+
+    def test_all_peers_healthy(self):
+        now = datetime.now(timezone.utc)
+        peers = ["http://p1:8420", "http://p2:8420"]
+        states = {
+            "http://p1:8420": self._peer_state(now - timedelta(minutes=5)),
+            "http://p2:8420": self._peer_state(now - timedelta(minutes=1)),
+        }
+        ctx = build_context(
+            node_name="n", status="armed",
+            peer_urls=peers, peer_states=states,
+            peer_down_threshold=timedelta(hours=6),
+        )
+        assert ctx["total_peers"] == 2
+        assert ctx["healthy_peers"] == 2
+        assert ctx["dead_peers"] == 0
+
+    def test_peer_past_threshold_is_dead(self):
+        now = datetime.now(timezone.utc)
+        peers = ["http://p1:8420"]
+        states = {"http://p1:8420": self._peer_state(now - timedelta(hours=7))}
+        ctx = build_context(
+            node_name="n", status="armed",
+            peer_urls=peers, peer_states=states,
+            peer_down_threshold=timedelta(hours=6),
+        )
+        assert ctx["healthy_peers"] == 0
+        assert ctx["dead_peers"] == 1
+
+    def test_transient_failure_with_recent_last_seen_is_healthy(self):
+        """The #3 fix: one failed probe (consecutive_failures>0) but a recent
+        last_seen must NOT count as dead, matching on_peer_down semantics."""
+        now = datetime.now(timezone.utc)
+        peers = ["http://p1:8420"]
+        states = {
+            "http://p1:8420": self._peer_state(
+                now - timedelta(minutes=2), consecutive_failures=3
+            ),
+        }
+        ctx = build_context(
+            node_name="n", status="armed",
+            peer_urls=peers, peer_states=states,
+            peer_down_threshold=timedelta(hours=6),
+        )
+        assert ctx["healthy_peers"] == 1
+        assert ctx["dead_peers"] == 0
+
+    def test_never_contacted_peer_is_dead(self):
+        peers = ["http://p1:8420"]
+        states = {"http://p1:8420": self._peer_state(None)}
+        ctx = build_context(
+            node_name="n", status="armed",
+            peer_urls=peers, peer_states=states,
+            peer_down_threshold=timedelta(hours=6),
+        )
+        assert ctx["healthy_peers"] == 0
+        assert ctx["dead_peers"] == 1
+
+    def test_no_peer_states_means_all_dead(self):
+        peers = ["http://p1:8420", "http://p2:8420"]
+        ctx = build_context(
+            node_name="n", status="armed",
+            peer_urls=peers, peer_states=None,
+        )
+        assert ctx["total_peers"] == 2
+        assert ctx["healthy_peers"] == 0
+        assert ctx["dead_peers"] == 2
+
+    def test_default_threshold_when_unset(self):
+        now = datetime.now(timezone.utc)
+        peers = ["http://p1:8420"]
+        # 5h old, default threshold is 6h -> still healthy
+        states = {"http://p1:8420": self._peer_state(now - timedelta(hours=5))}
+        ctx = build_context(
+            node_name="n", status="armed",
+            peer_urls=peers, peer_states=states,
+        )
+        assert ctx["healthy_peers"] == 1
+
+
 class TestNotificationSending:
     """Tests for actual notification sending."""
 

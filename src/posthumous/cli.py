@@ -456,16 +456,20 @@ def checkin(ctx: click.Context, token: str | None) -> None:
 
     _, config = _load_config_or_exit(ctx)
 
-    # Get TOTP code if no token provided
-    totp = None
-    if not token:
-        totp = click.prompt("TOTP code", hide_input=False)
+    totp = None if token else click.prompt("TOTP code", hide_input=False)
 
-    # Path 1: try the running daemon
+    # Prefer the running daemon so it owns auth, state, and peer broadcast.
     daemon_result = _try_daemon_checkin(config, totp, token)
 
     if isinstance(daemon_result, dict):
-        # Daemon answered successfully
+        # Trust the daemon's own success flag, not just the 200 status. A
+        # 200 body with success=false (e.g. a future handler shape) must NOT
+        # be reported as accepted: a false "checked in" is a silent
+        # suppression bug for a deadman switch.
+        if not daemon_result.get("success", False):
+            err = daemon_result.get("error", "unknown error")
+            click.echo(f"Daemon rejected check-in: {err}", err=True)
+            sys.exit(1)
         click.echo("✓ Check-in accepted (via daemon)")
         if daemon_result.get("status"):
             click.echo(f"  Status: {daemon_result['status'].upper()}")
@@ -474,11 +478,11 @@ def checkin(ctx: click.Context, token: str | None) -> None:
         return
 
     if isinstance(daemon_result, str):
-        # Daemon answered with an error (auth failed, locked out, triggered)
+        # The daemon answered but rejected us (auth failed, locked out, triggered).
         click.echo(f"Daemon rejected check-in: {daemon_result}", err=True)
         sys.exit(1)
 
-    # Path 2: daemon unreachable, fall back to direct
+    # daemon_result is None: daemon unreachable, check in directly against disk.
     click.echo("Daemon not running, checking in directly.", err=True)
 
     state_manager = StateManager(
@@ -516,17 +520,16 @@ def checkin(ctx: click.Context, token: str | None) -> None:
 
     state_manager.checkin()
 
-    # Broadcast to peers so they learn about this checkin even though
-    # no daemon is running locally to do it.
+    # No daemon is running, so broadcast this check-in to peers ourselves.
     if config.peers:
         import asyncio
         from posthumous.peers import PeerManager
 
-        async def _broadcast():
+        async def _broadcast() -> None:
             pm = PeerManager(config, state_manager)
             try:
                 results = await pm.broadcast_checkin(state_manager.state.last_checkin)
-                ok = sum(1 for v in results.values() if v)
+                ok = sum(1 for delivered in results.values() if delivered)
                 click.echo(f"  Broadcast to {ok}/{len(results)} peers")
             finally:
                 await pm.close()
