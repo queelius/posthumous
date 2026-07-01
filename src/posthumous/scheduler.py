@@ -155,10 +155,6 @@ class Scheduler:
             if not result.success:
                 errors.append(f"Script failed: {result.error}")
 
-        # Record execution in state
-        self.state_manager.state.mark_schedule_item_run(item.name, period_key)
-        self.state_manager.save()
-
         success = len(errors) == 0
         error = "; ".join(errors) if errors else None
 
@@ -170,13 +166,22 @@ class Scheduler:
             error=error,
         )
 
-        if self._on_scheduled_complete:
-            try:
-                await self._on_scheduled_complete(execution)
-            except Exception as e:
-                logger.exception(f"Error in on_scheduled_complete callback: {e}")
-
         if success:
+            # Only record completion when the action actually succeeded. On
+            # failure we deliberately leave the item UNMARKED (so this node
+            # retries it on the next tick) and do NOT broadcast completion (so
+            # peers run it themselves). A duplicate attempt is acceptable; a
+            # silently-dropped post-trigger action is exactly the suppression
+            # this project refuses to allow.
+            self.state_manager.state.mark_schedule_item_run(item.name, period_key)
+            self.state_manager.save()
+
+            if self._on_scheduled_complete:
+                try:
+                    await self._on_scheduled_complete(execution)
+                except Exception as e:
+                    logger.exception(f"Error in on_scheduled_complete callback: {e}")
+
             logger.info(f"Scheduled item '{item.name}' completed successfully")
         else:
             logger.error(f"Scheduled item '{item.name}' failed: {error}")

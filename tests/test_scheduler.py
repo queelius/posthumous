@@ -398,6 +398,60 @@ class TestExecuteItemExtended:
         assert "; " in execution.error
 
     @pytest.mark.asyncio
+    async def test_failed_item_not_marked_so_it_retries(self, config, state_manager):
+        """A failed scheduled action must NOT be recorded as run. Otherwise the
+        node treats it as done for the period and silently drops it; leaving it
+        unmarked lets the next tick retry (a duplicate attempt, never silence)."""
+        notification_manager = MagicMock(spec=NotificationManager)
+        notification_manager.send = AsyncMock(
+            return_value=MagicMock(success=False, error="channel down")
+        )
+        scheduler = Scheduler(config, state_manager, notification_manager)
+
+        item = config.post_trigger[0]  # immediate (notify)
+        execution = await scheduler.execute_item(item, "once")
+
+        assert execution.success is False
+        assert item.name not in state_manager.state.schedule_state
+
+    @pytest.mark.asyncio
+    async def test_failed_item_does_not_broadcast_completion(self, config, state_manager):
+        """A failed scheduled action must NOT tell peers it completed. Otherwise
+        one node's transient failure marks the item done on every peer and
+        suppresses the action across the whole federation."""
+        notification_manager = MagicMock(spec=NotificationManager)
+        notification_manager.send = AsyncMock(
+            return_value=MagicMock(success=False, error="channel down")
+        )
+        callback = AsyncMock()
+        scheduler = Scheduler(
+            config, state_manager, notification_manager,
+            on_scheduled_complete=callback,
+        )
+
+        item = config.post_trigger[0]
+        await scheduler.execute_item(item, "once")
+
+        callback.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_successful_item_marks_and_broadcasts(self, config, state_manager, notification_manager):
+        """The happy path is unchanged: a successful action is recorded locally
+        and broadcast so peers can dedupe."""
+        callback = AsyncMock()
+        scheduler = Scheduler(
+            config, state_manager, notification_manager,
+            on_scheduled_complete=callback,
+        )
+
+        item = config.post_trigger[0]
+        execution = await scheduler.execute_item(item, "once")
+
+        assert execution.success is True
+        assert item.name in state_manager.state.schedule_state
+        callback.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_callback_error_does_not_crash(self, config, state_manager, notification_manager):
         """Callback exception should be logged, not propagated."""
         callback = AsyncMock(side_effect=RuntimeError("callback boom"))
