@@ -241,7 +241,9 @@ class TestCheckinJSON:
     @pytest.mark.asyncio
     async def test_lockout_returns_429(self, client, state_manager):
         """Test that lockout after repeated failures returns 429."""
-        state_manager.state.lockout_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+        state_manager.state.lockouts = {
+            "127.0.0.1": datetime.now(timezone.utc) + timedelta(minutes=10)
+        }
 
         resp = await client.post(
             "/checkin",
@@ -251,6 +253,20 @@ class TestCheckinJSON:
         assert resp.status == 429
         data = await resp.json()
         assert data["success"] is False
+
+    @pytest.mark.asyncio
+    async def test_lockout_is_per_source(self, client, state_manager):
+        """A lockout scoped to a foreign source must not block this client: a
+        remote attacker cannot lock the owner out of their own check-in."""
+        state_manager.state.lockouts = {
+            "203.0.113.7": datetime.now(timezone.utc) + timedelta(minutes=10)
+        }
+
+        resp = await client.post("/checkin", json={"totp": "000000"})
+
+        # This client is a different source, so it is not locked out: a wrong
+        # code is a normal 401, not a 429 lockout.
+        assert resp.status == 401
 
     @pytest.mark.asyncio
     async def test_checkin_without_peer_manager(self, config, state_manager, watchdog, authenticator):
@@ -332,7 +348,9 @@ class TestCheckinForm:
     @pytest.mark.asyncio
     async def test_lockout_form_returns_html_error(self, client, state_manager):
         csrf = await get_csrf_token(client)
-        state_manager.state.lockout_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+        state_manager.state.lockouts = {
+            "127.0.0.1": datetime.now(timezone.utc) + timedelta(minutes=10)
+        }
 
         resp = await client.post(
             "/checkin",
@@ -544,12 +562,18 @@ class TestSyncScheduled:
     async def test_valid_sync_scheduled(self, client, state_manager):
         item_name = "annual-backup"
         period = "2026"
-        message = f"scheduled:{item_name}:{period}"
+        timestamp = datetime.now(timezone.utc).isoformat()
+        message = f"scheduled:{item_name}:{period}:{timestamp}"
         signature = sign_message(SECRET, message)
 
         resp = await client.post(
             "/sync/scheduled",
-            json={"item": item_name, "period": period, "signature": signature},
+            json={
+                "item": item_name,
+                "period": period,
+                "timestamp": timestamp,
+                "signature": signature,
+            },
         )
 
         assert resp.status == 200
@@ -561,9 +585,15 @@ class TestSyncScheduled:
 
     @pytest.mark.asyncio
     async def test_invalid_signature_returns_401(self, client):
+        timestamp = datetime.now(timezone.utc).isoformat()
         resp = await client.post(
             "/sync/scheduled",
-            json={"item": "task", "period": "2026", "signature": "wrong"},
+            json={
+                "item": "task",
+                "period": "2026",
+                "timestamp": timestamp,
+                "signature": "wrong",
+            },
         )
 
         assert resp.status == 401
@@ -598,6 +628,25 @@ class TestSyncScheduled:
         )
 
         assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_missing_timestamp_returns_400(self, client, state_manager):
+        """A scheduled completion without a timestamp must be rejected. The
+        timestamp is what makes the message non-replayable, so the old
+        signature-only (timestamp-less) path is gone: a captured completion can
+        no longer be replayed forever to suppress a post-trigger action."""
+        item_name = "annual-backup"
+        period = "2026"
+        # A signature valid under the OLD, timestamp-less scheme.
+        signature = sign_message(SECRET, f"scheduled:{item_name}:{period}")
+
+        resp = await client.post(
+            "/sync/scheduled",
+            json={"item": item_name, "period": period, "signature": signature},
+        )
+
+        assert resp.status == 400
+        assert item_name not in state_manager.state.schedule_state
 
     @pytest.mark.asyncio
     async def test_bad_json_returns_400(self, client):
@@ -996,7 +1045,9 @@ class TestFormHiding:
     @pytest.mark.asyncio
     async def test_lockout_hides_form(self, client, state_manager):
         """Lockout should hide the check-in form."""
-        state_manager.state.lockout_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+        state_manager.state.lockouts = {
+            "127.0.0.1": datetime.now(timezone.utc) + timedelta(minutes=10)
+        }
         resp = await client.get("/checkin")
         text = await resp.text()
         assert '<form' not in text
@@ -1013,7 +1064,9 @@ class TestFormHiding:
     async def test_lockout_on_checkin_post(self, client, state_manager):
         """Form POST with lockout should hide form in response."""
         csrf = await get_csrf_token(client)
-        state_manager.state.lockout_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+        state_manager.state.lockouts = {
+            "127.0.0.1": datetime.now(timezone.utc) + timedelta(minutes=10)
+        }
         resp = await client.post("/checkin", data={"totp": "000000", "csrf_token": csrf})
         text = await resp.text()
         assert '<form' not in text

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 import tempfile
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -431,11 +432,18 @@ class Config:
 
 def generate_default_config(node_name: str, secret_key: str) -> Config:
     """Generate a default configuration with sensible defaults."""
+    # A per-install, high-entropy ntfy topic rather than a shared, guessable
+    # public one. This keeps the default notification path working out of the
+    # box (a dead default would mean silence, the one failure mode we refuse to
+    # accept) while making the topic effectively unreadable and unspammable by
+    # anyone who has not seen this node's config. Operators should still move to
+    # an authenticated channel for real use.
+    default_topic = f"ntfy://posthumous-{secrets.token_hex(8)}"
     return Config(
         node_name=node_name,
         secret_key=secret_key,
         notifications={
-            'default': ['ntfy://posthumous-default'],
+            'default': [default_topic],
         },
         on_warning=[
             NotificationAction(

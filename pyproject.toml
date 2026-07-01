@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "posthumous"
-version = "0.8.1"
+version = "0.8.2"
 description = "A lightweight, federated deadman switch that triggers notifications and scripts when you stop checking in"
 readme = "README.md"
 license = "MIT"
@@ -44,6 +44,13 @@ dev = [
     "pytest-cov>=4.0",
     "aioresponses>=0.7",
     "freezegun>=1.2",
+    # aioresponses 0.7.x (latest) is incompatible with aiohttp >= 3.11
+    # (ClientResponse.__init__ gained a required stream_writer kwarg), which
+    # breaks the peer/server/CLI test mocks. Cap the test env to a validated
+    # aiohttp so a clean install reproduces the green suite. The runtime dep
+    # (aiohttp>=3.9) is intentionally left unconstrained; the daemon runs fine
+    # on newer aiohttp, only the test double is affected.
+    "aiohttp<3.11",
 ]
 
 [project.urls]

@@ -219,6 +219,45 @@ class TestPeerManagerBroadcast:
 
         await manager.close()
 
+    @pytest.mark.asyncio
+    async def test_broadcast_scheduled_complete_signs_fresh_timestamp(self, config, state_manager):
+        """The scheduled-complete broadcast must carry a fresh, signed timestamp
+        so receiving peers can enforce freshness and reject replays. There is no
+        timestamp-less path anymore."""
+        from posthumous.auth import verify_signature
+
+        manager = PeerManager(config, state_manager)
+
+        mock_response = MagicMock()
+        mock_response.status = 200
+
+        class MockContextManager:
+            async def __aenter__(self):
+                return mock_response
+
+            async def __aexit__(self, *args):
+                pass
+
+        mock_session = MagicMock()
+        mock_session.post = MagicMock(return_value=MockContextManager())
+        mock_session.closed = False
+        mock_session.close = AsyncMock()
+        manager._session = mock_session
+
+        await manager.broadcast_scheduled_complete("annual", "2026")
+        await manager.close()
+
+        payload = mock_session.post.call_args.kwargs["json"]
+        assert "timestamp" in payload
+        ts = payload["timestamp"]
+        # The timestamp is fresh (generated at broadcast time).
+        msg_time = datetime.fromisoformat(ts)
+        assert abs((datetime.now(timezone.utc) - msg_time).total_seconds()) < 60
+        # Signed over scheduled:item:period:timestamp, matching server verification.
+        assert verify_signature(
+            config.secret_key, f"scheduled:annual:2026:{ts}", payload["signature"]
+        )
+
 
 class TestPeerManagerStatus:
     """Tests for getting peer status."""

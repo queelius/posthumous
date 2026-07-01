@@ -585,9 +585,9 @@ class TestCheckinExtended:
         from posthumous.state import State
         from datetime import timedelta
 
-        # Create state with a lockout
+        # Create state with a lockout for the CLI source ("cli").
         state = State()
-        state.lockout_until = datetime.now(timezone.utc) + timedelta(minutes=15)
+        state.lockouts = {"cli": datetime.now(timezone.utc) + timedelta(minutes=15)}
         state.save(valid_config_dir / "state.yaml")
 
         result = runner.invoke(

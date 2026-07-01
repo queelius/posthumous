@@ -277,12 +277,17 @@ class Server:
         """Generate a CSRF token for double-submit cookie protection."""
         return secrets.token_hex(32)
 
-    def _get_form_html(self, csrf_token: str = "") -> str:
-        """Get the appropriate form HTML based on current state."""
+    def _get_form_html(self, csrf_token: str = "", source: str | None = None) -> str:
+        """Get the appropriate form HTML based on current state.
+
+        `source` is the requester's address so the lockout form is shown only to
+        a source that is actually locked out; a locked-out attacker cannot hide
+        the check-in form from the legitimate owner on a different source.
+        """
         state = self.state_manager.state
         if state.status == Status.TRIGGERED:
             return self._TRIGGERED_HTML
-        if state.is_locked_out():
+        if state.is_locked_out(source):
             return self._LOCKOUT_HTML
         return (
             '<form method="POST" action="/checkin">'
@@ -351,7 +356,7 @@ class Server:
             time_info=self._get_time_info(),
             node_name=self.config.node_name,
             message="",
-            form_html=self._get_form_html(csrf_token),
+            form_html=self._get_form_html(csrf_token, source=request.remote),
         )
         response = web.Response(text=html, content_type='text/html')
         response.set_cookie('csrf_token', csrf_token, httponly=True, samesite='Strict')
@@ -516,7 +521,7 @@ class Server:
                 time_info=self._get_time_info(),
                 node_name=self.config.node_name,
                 message=f'<div class="message error">{e}</div>',
-                form_html=self._get_form_html(),
+                form_html=self._get_form_html(source=client_ip),
             )
             return web.Response(text=html, content_type='text/html')
 
@@ -534,7 +539,7 @@ class Server:
                 time_info=self._get_time_info(),
                 node_name=self.config.node_name,
                 message='<div class="message error">Invalid code. Please try again.</div>',
-                form_html=self._get_form_html(),
+                form_html=self._get_form_html(source=client_ip),
             )
             return web.Response(text=html, content_type='text/html')
 
@@ -682,23 +687,18 @@ class Server:
         timestamp = data.get('timestamp')
         signature = data.get('signature')
 
-        if not item_name or not period or not signature:
+        # A timestamp is mandatory: it is what makes the message non-replayable.
+        # There is deliberately no signature-only fallback anymore, so a captured
+        # scheduled-complete cannot be replayed to suppress a post-trigger action.
+        if not item_name or not period or not timestamp or not signature:
             return web.json_response({'error': 'Missing fields'}, status=400)
 
-        if timestamp:
-            error = self._verify_sync_message(
-                timestamp, signature, f"scheduled:{item_name}:{period}"
-            )
-            if error:
-                logger.warning(f"Sync scheduled rejected: {error}")
-                return web.json_response({'error': error}, status=401)
-        else:
-            # Legacy: no timestamp, verify signature only
-            from posthumous.auth import verify_signature
-            message = f"scheduled:{item_name}:{period}"
-            if not verify_signature(self.config.secret_key, message, signature):
-                logger.warning("Invalid signature on sync scheduled")
-                return web.json_response({'error': 'Invalid signature'}, status=401)
+        error = self._verify_sync_message(
+            timestamp, signature, f"scheduled:{item_name}:{period}"
+        )
+        if error:
+            logger.warning(f"Sync scheduled rejected: {error}")
+            return web.json_response({'error': error}, status=401)
 
         # Mark item as complete
         self.state_manager.state.mark_schedule_item_run(item_name, period)

@@ -144,6 +144,24 @@ class TestAuthenticator:
         with pytest.raises(LockedOutError):
             auth.verify(code="000000", state=state)
 
+    def test_lockout_is_per_source(self):
+        """Failed attempts from one source must not lock out a different source,
+        so a remote attacker cannot lock out the legitimate owner."""
+        auth = Authenticator(
+            "JBSWY3DPEHPK3PXP", max_attempts=3, lockout_duration=timedelta(minutes=15)
+        )
+        state = State()
+
+        # Attacker exhausts the limit from their address and gets locked out.
+        for _ in range(3):
+            auth.verify(code="000000", state=state, source="1.2.3.4")
+        with pytest.raises(LockedOutError):
+            auth.verify(code="000000", state=state, source="1.2.3.4")
+
+        # The owner, from a different address, is NOT locked out: a wrong code
+        # returns False rather than raising LockedOutError.
+        assert auth.verify(code="000000", state=state, source="127.0.0.1") is False
+
     def test_successful_auth_clears_failures(self):
         secret = generate_secret()
         auth = Authenticator(secret)
@@ -173,7 +191,7 @@ class TestAuthenticator:
         result = auth.verify(token="valid-token", state=state, source="test")
         assert result is True
         assert len(state.failed_attempts) == 0
-        assert state.lockout_until is None
+        assert state.lockouts == {}
 
     def test_get_current_code(self):
         secret = generate_secret()

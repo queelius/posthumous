@@ -44,7 +44,7 @@ class TestState:
         state.record_checkin()
 
         assert len(state.failed_attempts) == 0
-        assert state.lockout_until is None
+        assert state.lockouts == {}
 
     def test_transition_armed_to_warning(self):
         state = State()
@@ -102,9 +102,9 @@ class TestState:
         for _ in range(5):
             state.record_failed_attempt("test")
 
-        state.check_and_set_lockout(5, lockout_duration)
+        state.check_and_set_lockout(5, lockout_duration, "test")
 
-        assert state.is_locked_out()
+        assert state.is_locked_out("test")
 
     def test_peer_tracking(self):
         state = State()
@@ -365,19 +365,19 @@ class TestLockoutExtended:
     """Additional lockout mechanism tests."""
 
     def test_lockout_expiry(self):
-        """After lockout expires, should no longer be locked out."""
+        """After a source's lockout expires, it should no longer be locked out."""
         state = State()
-        state.lockout_until = datetime.now(timezone.utc) - timedelta(minutes=1)
-        assert not state.is_locked_out()
+        state.lockouts["1.2.3.4"] = datetime.now(timezone.utc) - timedelta(minutes=1)
+        assert not state.is_locked_out("1.2.3.4")
 
     def test_max_attempts_zero(self):
         """With max_attempts=0, any attempt should trigger lockout."""
         state = State()
         state.record_failed_attempt("test")
-        result = state.check_and_set_lockout(0, timedelta(minutes=15))
+        result = state.check_and_set_lockout(0, timedelta(minutes=15), "test")
         # 1 attempt >= 0, so lockout should trigger
         assert result is True
-        assert state.is_locked_out()
+        assert state.is_locked_out("test")
 
     def test_sliding_window_lockout(self):
         """Failed attempts outside the lockout window shouldn't count."""
@@ -393,8 +393,42 @@ class TestLockoutExtended:
             ))
 
         # These are outside the 15-minute window
-        result = state.check_and_set_lockout(5, lockout_duration)
+        result = state.check_and_set_lockout(5, lockout_duration, "test")
         assert result is False
+
+    def test_lockout_is_per_source(self):
+        """A lockout is scoped to the offending source: one source hitting the
+        limit must not lock out a different, innocent source (e.g. the owner).
+        This defeats the griefing vector where a remote attacker submits bad
+        codes to lock the legitimate owner out."""
+        state = State()
+        duration = timedelta(minutes=15)
+
+        for _ in range(5):
+            state.record_failed_attempt("1.2.3.4")  # attacker
+        assert state.check_and_set_lockout(5, duration, "1.2.3.4") is True
+
+        assert state.is_locked_out("1.2.3.4") is True
+        assert state.is_locked_out("10.0.0.9") is False  # owner, untouched
+
+    def test_foreign_source_failures_do_not_count(self):
+        """check_and_set_lockout only counts attempts from the same source."""
+        state = State()
+        duration = timedelta(minutes=15)
+        for _ in range(4):
+            state.record_failed_attempt("1.2.3.4")
+        for _ in range(4):
+            state.record_failed_attempt("5.6.7.8")
+        # Neither source alone reaches 5, so neither is locked.
+        assert state.check_and_set_lockout(5, duration, "1.2.3.4") is False
+        assert state.is_locked_out("1.2.3.4") is False
+
+    def test_is_locked_out_without_source_is_false(self):
+        """Rendering paths that do not know the viewer's source must never hide
+        the check-in form: an unknown viewer is treated as not-locked-out."""
+        state = State()
+        state.lockouts = {"1.2.3.4": datetime.now(timezone.utc) + timedelta(minutes=10)}
+        assert state.is_locked_out() is False
 
 
 class TestStateEdgeCases:

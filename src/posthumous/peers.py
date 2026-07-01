@@ -211,8 +211,16 @@ class PeerManager:
         item_name: str,
         period: str,
     ) -> dict[str, bool]:
-        """Broadcast scheduled item completion to all peers."""
-        signature = sign_message(self.config.secret_key, f"scheduled:{item_name}:{period}")
+        """Broadcast scheduled item completion to all peers.
+
+        The message carries a fresh timestamp inside the signature so receiving
+        peers can enforce freshness and reject replays; a captured completion can
+        no longer be replayed forever to suppress a post-trigger action.
+        """
+        timestamp_str = datetime.now(timezone.utc).isoformat()
+        signature = sign_message(
+            self.config.secret_key, f"scheduled:{item_name}:{period}:{timestamp_str}"
+        )
 
         return await self._broadcast_to_all(
             "sync/scheduled",
@@ -220,6 +228,7 @@ class PeerManager:
                 "event": "scheduled_complete",
                 "item": item_name,
                 "period": period,
+                "timestamp": timestamp_str,
                 "signature": signature,
                 "node": self.config.node_name,
             },

@@ -39,7 +39,7 @@ pip install -e ".[dev]"
 
 ```bash
 pip install -e ".[dev]"
-pytest                          # Run all tests (448 tests, 98% coverage)
+pytest                          # Run all tests (729 tests, 97% coverage)
 ```
 
 ## Quick Start
@@ -131,7 +131,14 @@ actions:
     - notify: urgent
       message: "Posthumous has activated."
     - script: "scripts/on_trigger.py"
+  on_peer_down:
+    - notify: urgent
+      message: "Federation degraded: {healthy_peers}/{total_peers} peers healthy."
 ```
+
+`on_peer_down` fires when a peer stays unreachable past `peer_down_threshold` (see
+Federation). It is your early warning that redundancy is eroding, so treat it as a
+loud alert: the all-node-failure limitation in the threat model assumes you act on it.
 
 **Template variables** available in messages:
 
@@ -143,6 +150,9 @@ actions:
 | `{hours_left}` | Hours until trigger |
 | `{last_checkin}` | Last check-in timestamp |
 | `{trigger_time}` | When the trigger fired |
+| `{healthy_peers}` | Reachable peers (most useful in `on_peer_down`) |
+| `{total_peers}` | Configured peers (most useful in `on_peer_down`) |
+| `{dead_peers}` | Unreachable peers (most useful in `on_peer_down`) |
 
 ### Post-Trigger Schedule
 
@@ -291,6 +301,13 @@ notifications:
     - "ntfy://my-private-topic"
     - "ntfy://user:pass@ntfy.example.com/topic"
 ```
+
+`init` seeds the default channel with a random, per-install topic
+(`ntfy://posthumous-<random>`) so notifications work out of the box without
+leaking to a shared, guessable public topic. Public ntfy topics are still
+unauthenticated: anyone who learns the topic name can read your messages. For
+anything sensitive, switch to an authenticated channel or a private ntfy server
+(`ntfy://user:pass@ntfy.example.com/topic`).
 
 ### Email (SMTP)
 
@@ -550,6 +567,8 @@ Posthumous uses RFC 6238 TOTP with 6-digit codes and a 30-second time step. The 
 
 After `max_failed_attempts` (default: 5) failed authentication attempts within `lockout_duration` (default: 15 minutes), the node locks out further attempts for `lockout_duration`.
 
+Lockout is **per source** (keyed on the client address, or `cli` for local check-ins), so a flood of bad codes from one address cannot lock out the legitimate owner checking in from another. A successful check-in clears every source's lockout. One caveat: sources that share an address (clients behind a reverse proxy that does not forward the real client IP, NAT, or all local traffic on a loopback bind) share a single lockout bucket. Honoring a trusted `X-Forwarded-For` for proxied deployments is a future direction; until then, an attacker sharing your apparent source can still lock that bucket (recover with `phm checkin` from the host, which uses the `cli` source, or `phm reset`).
+
 ### API Token
 
 For automation, set `api_token` in config. Use with `posthumous checkin --token <token>` or via the JSON API. The token provides the same access as a valid TOTP code — use with caution.
@@ -598,12 +617,25 @@ Commands:
     edit              Open in $EDITOR, validate on close
 
   run                 Start the daemon
-    -d, --daemon      Background mode (not yet implemented)
+    -d, --daemon      Run in the background (double-fork, writes a PID file)
+    --stop            Stop a daemon started with --daemon
+
+  service             Manage a user-mode systemd unit
+    install           Write ~/.config/systemd/user/posthumous.service and enable it
+    uninstall         Disable and remove the unit
+    status            systemctl --user status posthumous
+    logs [-f]         journalctl --user -u posthumous
 
   checkin             Check in to reset timer
     -t, --token TEXT  Use API token instead of TOTP
 
   status              Show current status and time remaining
+
+  reset               Reset local state to ARMED (admin recovery; can undo
+                      TRIGGERED with confirmation)
+
+  recover             Rebuild a corrupt state.yaml from the healthiest peer
+    --force           Skip confirmation
 
   peers               Show peer status
 
@@ -612,7 +644,8 @@ Commands:
 
   test-trigger        Dry-run trigger actions
 
-  export PATH         Export state and config to YAML
+  export PATH         Export state and config to plaintext YAML (decrypts if
+                      encrypted at rest)
   import PATH         Import state from YAML backup
 ```
 
@@ -661,9 +694,27 @@ When running with `-v` (verbose), debug-level logs are written to both stdout an
 
 ## Running as a Service
 
-### systemd
+### systemd (recommended: `phm service install`)
 
-Create `/etc/systemd/system/posthumous.service`:
+The simplest and safest path is the built-in installer, which writes a user-mode
+unit and enables it:
+
+```bash
+phm service install     # writes ~/.config/systemd/user/posthumous.service, enables it
+phm service status      # systemctl --user status posthumous
+phm service logs -f     # journalctl --user -u posthumous -f
+```
+
+The generated unit is `Type=notify` with `WatchdogSec=30`. That is deliberate: the
+daemon sends periodic heartbeats over `sd_notify`, so systemd restarts it not only
+when it exits but also when it hangs while still alive. A hung-but-alive daemon that
+never fires is exactly the silent-suppression failure this project refuses to accept,
+so a plain `Type=simple` unit (which only restarts on exit) is not good enough.
+
+### Manual system-wide unit
+
+If you want a system unit instead, mirror those settings. Create
+`/etc/systemd/system/posthumous.service`:
 
 ```ini
 [Unit]
@@ -671,9 +722,10 @@ Description=Posthumous Deadman Switch
 After=network.target
 
 [Service]
-Type=simple
+Type=notify
 User=your-username
 ExecStart=/usr/local/bin/posthumous run
+WatchdogSec=30
 Restart=always
 RestartSec=10
 

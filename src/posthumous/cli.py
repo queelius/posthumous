@@ -296,9 +296,12 @@ def init(ctx: click.Context, node_name: str, join_url: str | None) -> None:
     click.echo("You'll need it to set up additional nodes.")
     click.echo("=" * 50)
 
+    default_channel = config.notifications["default"][0]
     click.echo("\nNext steps:")
     click.echo("  1. Add the TOTP to your authenticator app")
-    click.echo("  2. Edit ~/.posthumous/config.yaml to configure notifications")
+    click.echo(f"  2. Default notifications go to: {default_channel}")
+    click.echo("     Subscribe to that ntfy topic (or edit config.yaml to change it),")
+    click.echo("     then verify delivery with: posthumous test-notify")
     click.echo("  3. Run: posthumous run")
 
 

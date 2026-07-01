@@ -194,9 +194,9 @@ class Authenticator:
             LockedOutError: If too many failed attempts
             AuthError: If neither code nor token provided
         """
-        # Check lockout
-        if state and state.is_locked_out():
-            raise LockedOutError(state.lockout_until)  # type: ignore
+        # Check lockout (per source, so one address cannot lock out another)
+        if state and state.is_locked_out(source):
+            raise LockedOutError(state.lockouts.get(source))  # type: ignore
 
         if code is None and token is None:
             raise AuthError("Either TOTP code or API token required")
@@ -210,11 +210,13 @@ class Authenticator:
 
         if not success and state:
             state.record_failed_attempt(source)
-            state.check_and_set_lockout(self.max_attempts, self.lockout_duration)
+            state.check_and_set_lockout(
+                self.max_attempts, self.lockout_duration, source
+            )
 
         if success and state:
             state.failed_attempts = []
-            state.lockout_until = None
+            state.lockouts = {}
 
         return success
 

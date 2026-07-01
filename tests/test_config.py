@@ -198,6 +198,28 @@ class TestGenerateDefaultConfig:
         assert len(config.on_trigger) > 0
         assert config.validate() == []
 
+    def test_default_ntfy_topic_is_per_install_random(self):
+        """The default notification topic must not be a shared, guessable public
+        topic. Two installs must get different high-entropy ntfy topics so trigger
+        messages cannot be read (or spammed to bury real alerts) by anyone who
+        guesses the topic name, while still leaving a working default channel."""
+        c1 = generate_default_config("node-a", "JBSWY3DPEHPK3PXP")
+        c2 = generate_default_config("node-b", "JBSWY3DPEHPK3PXP")
+
+        topic1 = c1.notifications["default"][0]
+        topic2 = c2.notifications["default"][0]
+
+        # Not the old shared, globally-guessable literal.
+        assert topic1 != "ntfy://posthumous-default"
+        # Per-install randomness: a fresh topic on every generation.
+        assert topic1 != topic2
+        # Recognisable, valid, high-entropy ntfy topic.
+        assert topic1.startswith("ntfy://posthumous-")
+        suffix = topic1.removeprefix("ntfy://posthumous-")
+        assert len(suffix) >= 12
+        # Still a working default channel (no silent-dead default).
+        assert c1.validate() == []
+
 
 class TestConfigToDictExtended:
     """Additional tests for Config.to_dict()."""

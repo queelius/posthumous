@@ -80,7 +80,10 @@ class State:
 
     # Security
     failed_attempts: list[FailedAttempt] = field(default_factory=list)
-    lockout_until: datetime | None = None
+    # Per-source lockout expiries (source identifier -> locked-until time).
+    # Scoped per source so a flood of bad codes from one address cannot lock
+    # out the legitimate owner checking in from another.
+    lockouts: dict[str, datetime] = field(default_factory=dict)
 
     # Peer tracking
     peer_states: dict[str, PeerState] = field(default_factory=dict)
@@ -154,6 +157,16 @@ class State:
                     alerted_at=parse_datetime(peer_data.get('alerted_at')),
                 )
 
+        # Parse per-source lockouts. Legacy files carry a scalar `lockout_until`
+        # instead; lockout state is ephemeral (an anti-brute-force timer), so we
+        # simply start from the per-source map and let any old global lockout
+        # lapse rather than migrating it to an unknown source.
+        lockouts = {}
+        for src, until in data.get('lockouts', {}).items():
+            parsed = parse_datetime(until)
+            if parsed is not None:
+                lockouts[src] = parsed
+
         status_str = data.get('status', 'armed')
         try:
             status = Status(status_str)
@@ -166,7 +179,7 @@ class State:
             trigger_time=parse_datetime(data.get('trigger_time')),
             schedule_state=schedule_state,
             failed_attempts=failed_attempts,
-            lockout_until=parse_datetime(data.get('lockout_until')),
+            lockouts=lockouts,
             peer_states=peer_states,
             created_at=parse_datetime(data.get('created_at')) or datetime.now(timezone.utc),
             last_modified=parse_datetime(data.get('last_modified')) or datetime.now(timezone.utc),
@@ -204,7 +217,9 @@ class State:
             'trigger_time': format_datetime(self.trigger_time),
             'schedule_state': schedule_state,
             'failed_attempts': failed_attempts,
-            'lockout_until': format_datetime(self.lockout_until),
+            'lockouts': {
+                src: format_datetime(until) for src, until in self.lockouts.items()
+            },
             'peer_states': peer_states,
             'created_at': format_datetime(self.created_at),
             'last_modified': format_datetime(datetime.now(timezone.utc)),
@@ -251,9 +266,9 @@ class State:
         """Record a successful check-in."""
         self.last_checkin = timestamp or datetime.now(timezone.utc)
         self.status = Status.ARMED
-        # Clear failed attempts on successful checkin
+        # Clear failed attempts and any lockouts on successful checkin
         self.failed_attempts = []
-        self.lockout_until = None
+        self.lockouts = {}
 
     def transition_to(self, new_status: Status, trigger_time: datetime | None = None) -> bool:
         """Transition to a new status if valid.
@@ -296,24 +311,40 @@ class State:
             source=source,
         ))
 
-    def is_locked_out(self) -> bool:
-        """Check if authentication is currently locked out."""
-        if self.lockout_until is None:
+    def is_locked_out(self, source: str | None = None) -> bool:
+        """Check whether authentication is currently locked out for a source.
+
+        Lockout is per-source. A caller that does not know the source (e.g. a
+        form-render path that has no request context) is treated as not locked
+        out, so an attacker's lockout can never hide the check-in form from an
+        unknown viewer.
+        """
+        if source is None:
             return False
-        return datetime.now(timezone.utc) < self.lockout_until
+        until = self.lockouts.get(source)
+        if until is None:
+            return False
+        return datetime.now(timezone.utc) < until
 
-    def check_and_set_lockout(self, max_attempts: int, lockout_duration) -> bool:
-        """Check recent failed attempts and set lockout if needed.
+    def check_and_set_lockout(
+        self, max_attempts: int, lockout_duration, source: str
+    ) -> bool:
+        """Lock out `source` if it has reached the failure limit in the window.
 
-        Returns True if lockout was set.
+        Only attempts from the same source count toward that source's lockout,
+        so one address cannot lock out another. Returns True if a lockout was
+        set.
         """
         now = datetime.now(timezone.utc)
-        # Count attempts in the lockout window
+        # Count this source's attempts within the lockout window.
         cutoff = now - lockout_duration
-        recent_attempts = [a for a in self.failed_attempts if a.timestamp > cutoff]
+        recent_attempts = [
+            a for a in self.failed_attempts
+            if a.timestamp > cutoff and a.source == source
+        ]
 
         if len(recent_attempts) >= max_attempts:
-            self.lockout_until = now + lockout_duration
+            self.lockouts[source] = now + lockout_duration
             return True
         return False
 
