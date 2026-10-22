@@ -12,6 +12,7 @@ from posthumous.config import (
     ScheduledItem,
     parse_duration,
     generate_default_config,
+    action_keys,
 )
 
 
@@ -794,3 +795,28 @@ class TestOnPeerDown:
         errors = config.validate()
         assert any("nonexistent" in e and "on_peer_down" in e for e in errors)
 
+
+
+
+class TestActionKeys:
+    """action_keys gives each action a stable identity derived from its content."""
+
+    def test_same_actions_same_keys(self):
+        a = [NotificationAction(channel="default", message="hi"), ScriptAction(script="x.sh")]
+        b = [NotificationAction(channel="default", message="hi"), ScriptAction(script="x.sh")]
+        assert action_keys(a) == action_keys(b)
+
+    def test_key_follows_the_action_not_its_position(self):
+        hi = NotificationAction(channel="default", message="hi")
+        run = ScriptAction(script="x.sh")
+        assert action_keys([hi, run]) == list(reversed(action_keys([run, hi])))
+
+    def test_editing_an_action_changes_its_key(self):
+        before = action_keys([NotificationAction(channel="default", message="hi")])
+        after = action_keys([NotificationAction(channel="default", message="hello")])
+        assert before != after
+
+    def test_identical_actions_get_distinct_keys(self):
+        hi = NotificationAction(channel="default", message="hi")
+        keys = action_keys([hi, hi])
+        assert len(set(keys)) == 2

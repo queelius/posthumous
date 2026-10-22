@@ -634,6 +634,57 @@ class TestWatchdogRunLoopEdgeCases:
         assert call_count >= 2
 
 
+class TestTick:
+    """Watchdog.tick: advance the state machine, then settle while TRIGGERED."""
+
+    @staticmethod
+    def _triggered(state_manager):
+        state_manager.state.last_checkin = datetime.now(timezone.utc) - timedelta(days=15)
+        state_manager.state.status = Status.TRIGGERED
+        state_manager.state.trigger_time = datetime.now(timezone.utc)
+
+    @pytest.mark.asyncio
+    async def test_calls_while_triggered_when_already_triggered(self, config, state_manager):
+        settle = AsyncMock()
+        watchdog = Watchdog(config, state_manager, while_triggered=settle)
+        self._triggered(state_manager)
+
+        await watchdog.tick()
+
+        settle.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_skips_while_triggered_on_the_triggering_tick(self, config, state_manager):
+        """on_trigger handles the tick that fires the transition itself."""
+        settle, on_trigger = AsyncMock(), AsyncMock()
+        watchdog = Watchdog(config, state_manager, on_trigger=on_trigger, while_triggered=settle)
+        state_manager.state.last_checkin = datetime.now(timezone.utc) - timedelta(days=15)
+
+        await watchdog.tick()
+
+        on_trigger.assert_awaited_once()
+        settle.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_not_called_before_trigger(self, config, state_manager):
+        settle = AsyncMock()
+        watchdog = Watchdog(config, state_manager, while_triggered=settle)
+        state_manager.state.last_checkin = datetime.now(timezone.utc)
+
+        await watchdog.tick()
+
+        settle.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_settle_error_does_not_kill_the_loop(self, config, state_manager):
+        watchdog = Watchdog(
+            config, state_manager, while_triggered=AsyncMock(side_effect=RuntimeError("boom")),
+        )
+        self._triggered(state_manager)
+
+        await watchdog.tick()  # logged, not raised
+
+
 class TestFormatDuration:
     """Tests for _format_duration() helper (Issue 1)."""
 

@@ -18,6 +18,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from freezegun import freeze_time
 
 from posthumous.config import (
     Config,
@@ -379,6 +380,142 @@ class TestExecuteActionsRealCallbacks:
         script_context = args[1]
         assert script_context.event == "warning"
         assert script_context.node_name == config.node_name
+
+
+
+class TestTriggerActionsSettle:
+    """on_trigger actions run on every node that becomes TRIGGERED, by any route,
+    and are retried until each one succeeds."""
+
+    @staticmethod
+    def _adopt_trigger_from_peer(runner) -> None:
+        """Mark TRIGGERED the way /sync/trigger does: no watchdog callback."""
+        sm = runner.state_manager
+        sm.state.last_checkin = datetime.now(timezone.utc) - timedelta(days=13)
+        sm.state.status = Status.GRACE
+        assert sm.transition(Status.TRIGGERED)
+
+    @pytest.mark.asyncio
+    async def test_peer_adopted_trigger_runs_actions_on_next_tick(self, config_dir):
+        config = _make_config(
+            config_dir,
+            on_trigger=[NotificationAction(channel="default", message="gone")],
+        )
+        runner = DaemonRunner(config)
+        runner.build_components()
+        self._adopt_trigger_from_peer(runner)
+
+        with patch("apprise.Apprise.notify", return_value=True) as notify:
+            await runner.watchdog.tick()
+
+        assert notify.call_count == 1
+        assert notify.call_args.kwargs["body"] == "gone"
+
+    @pytest.mark.asyncio
+    async def test_failed_action_is_retried_after_backoff_without_repeating_successes(
+        self, config_dir,
+    ):
+        config = _make_config(
+            config_dir,
+            on_trigger=[
+                NotificationAction(channel="default", message="first"),
+                NotificationAction(channel="default", message="second"),
+            ],
+        )
+        sent: list[str] = []
+        second_is_down = True
+
+        def notify(title, body):
+            if body == "second" and second_is_down:
+                return False
+            sent.append(body)
+            return True
+
+        with freeze_time("2026-03-01 12:00:00") as clock, \
+             patch("apprise.Apprise.notify", side_effect=notify):
+            runner = DaemonRunner(config)
+            runner.build_components()
+            runner.notification_manager.retry_delay = 0
+            self._adopt_trigger_from_peer(runner)
+
+            await runner.watchdog.tick()
+            assert sent == ["first"]
+
+            second_is_down = False
+            await runner.watchdog.tick()  # still inside the backoff window
+            assert sent == ["first"]
+
+            clock.tick(timedelta(minutes=1))
+            await runner.watchdog.tick()
+            await runner.watchdog.tick()
+
+        assert sent == ["first", "second"]
+
+    @pytest.mark.asyncio
+    async def test_action_added_after_trigger_runs_and_done_ones_do_not_repeat(
+        self, config_dir,
+    ):
+        """An executor fixing a broken setup by editing on_trigger after the trigger:
+        the new action runs, the one that already succeeded is not re-sent."""
+        done = NotificationAction(channel="default", message="already sent")
+        config = _make_config(config_dir, on_trigger=[done])
+        runner = DaemonRunner(config)
+        runner.build_components()
+        self._adopt_trigger_from_peer(runner)
+        with patch("apprise.Apprise.notify", return_value=True):
+            await runner.watchdog.tick()
+
+        edited = _make_config(
+            config_dir,
+            on_trigger=[NotificationAction(channel="default", message="fixed"), done],
+        )
+        restarted = DaemonRunner(edited)
+        restarted.build_components()
+        with patch("apprise.Apprise.notify", return_value=True) as notify:
+            await restarted.watchdog.tick()
+
+        assert [c.kwargs["body"] for c in notify.call_args_list] == ["fixed"]
+
+    @pytest.mark.asyncio
+    async def test_own_trigger_runs_actions_once(self, config_dir):
+        """A node that fires on its own timer runs each action once, not again on
+        the following ticks."""
+        config = _make_config(
+            config_dir,
+            on_trigger=[NotificationAction(channel="default", message="gone")],
+        )
+        runner = DaemonRunner(config)
+        runner.build_components()
+        runner.state_manager.state.last_checkin = (
+            datetime.now(timezone.utc) - timedelta(days=15)
+        )
+
+        with patch.object(runner.peer_manager, "broadcast_trigger", new_callable=AsyncMock), \
+             patch("apprise.Apprise.notify", return_value=True) as notify:
+            await runner.watchdog.tick()
+            await runner.watchdog.tick()
+
+        assert runner.state_manager.state.status == Status.TRIGGERED
+        assert notify.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_restart_after_crash_mid_actions_finishes_them(self, config_dir):
+        """TRIGGERED was persisted but the process died before the actions ran:
+        a fresh runner on the same state still runs them."""
+        config = _make_config(
+            config_dir,
+            on_trigger=[NotificationAction(channel="default", message="gone")],
+        )
+        crashed = DaemonRunner(config)
+        crashed.build_components()
+        self._adopt_trigger_from_peer(crashed)  # persists TRIGGERED, runs nothing
+
+        restarted = DaemonRunner(config)
+        restarted.build_components()
+        with patch("apprise.Apprise.notify", return_value=True) as notify:
+            await restarted.watchdog.tick()
+
+        assert notify.call_count == 1
 
 
 class TestStateRecovery:

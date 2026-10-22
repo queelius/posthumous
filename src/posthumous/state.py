@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -83,6 +83,19 @@ class PeerState:
     alerted_at: datetime | None = None
 
 
+# Retry backoff for a failed on_trigger action: 1 min, doubling, capped.
+TRIGGER_RETRY_BASE = timedelta(minutes=1)
+TRIGGER_RETRY_MAX = timedelta(hours=6)
+
+
+@dataclass
+class TriggerActionState:
+    """Delivery record for one on_trigger action within one trigger episode."""
+    done: bool = False
+    attempts: int = 0
+    retry_at: datetime | None = None
+
+
 @dataclass
 class State:
     """Runtime state for Posthumous."""
@@ -91,6 +104,15 @@ class State:
     last_checkin: datetime | None = None
     status: Status = Status.ARMED
     trigger_time: datetime | None = None
+
+    # on_trigger delivery records (config.action_keys key -> record) for the
+    # trigger episode identified by `trigger_episode` (the trigger_time they
+    # were made under). A TRIGGERED node owes every action without a done
+    # record for the current episode, which is what lets a node that adopted
+    # TRIGGERED from a peer, crashed mid-actions, or re-triggered after a
+    # recover still run them.
+    trigger_episode: datetime | None = None
+    trigger_actions: dict[str, TriggerActionState] = field(default_factory=dict)
 
     # Schedule tracking
     schedule_state: dict[str, ScheduleItemState] = field(default_factory=dict)
@@ -190,10 +212,24 @@ class State:
         except ValueError:
             status = Status.ARMED
 
+        # Malformed records are skipped, which leaves those actions owed: a
+        # possible duplicate, never silence. Files from before this field
+        # existed have no records, so a TRIGGERED one owes its actions.
+        trigger_actions = {}
+        for key, rec in (data.get('trigger_actions') or {}).items():
+            if isinstance(rec, dict):
+                trigger_actions[key] = TriggerActionState(
+                    done=bool(rec.get('done')),
+                    attempts=int(rec.get('attempts') or 0),
+                    retry_at=parse_datetime(rec.get('retry_at')),
+                )
+
         return cls(
             last_checkin=parse_datetime(data.get('last_checkin')),
             status=status,
             trigger_time=parse_datetime(data.get('trigger_time')),
+            trigger_episode=parse_datetime(data.get('trigger_episode')),
+            trigger_actions=trigger_actions,
             schedule_state=schedule_state,
             failed_attempts=failed_attempts,
             lockouts=lockouts,
@@ -232,6 +268,15 @@ class State:
             'last_checkin': format_datetime(self.last_checkin),
             'status': self.status.value,
             'trigger_time': format_datetime(self.trigger_time),
+            'trigger_episode': format_datetime(self.trigger_episode),
+            'trigger_actions': {
+                key: {
+                    'done': rec.done,
+                    'attempts': rec.attempts,
+                    'retry_at': format_datetime(rec.retry_at),
+                }
+                for key, rec in self.trigger_actions.items()
+            },
             'schedule_state': schedule_state,
             'failed_attempts': failed_attempts,
             'lockouts': {
@@ -265,12 +310,14 @@ class State:
         """Record a successful check-in."""
         self.last_checkin = timestamp or datetime.now(timezone.utc)
         self.status = Status.ARMED
-        self.clear_auth_failures()
+        # Lockouts are deliberately untouched: a check-in (possibly relayed
+        # from a peer) proves the owner is alive, not that another source
+        # stopped guessing. A successful auth clears its own source instead.
 
-    def clear_auth_failures(self) -> None:
-        """Forget all failed attempts and lockouts (after a successful auth)."""
-        self.failed_attempts = []
-        self.lockouts = {}
+    def clear_auth_failures(self, source: str) -> None:
+        """Forget `source`'s failed attempts and lockout after it authenticates."""
+        self.failed_attempts = [a for a in self.failed_attempts if a.source != source]
+        self.lockouts.pop(source, None)
 
     def transition_to(self, new_status: Status, trigger_time: datetime | None = None) -> bool:
         """Transition to a new status if valid.
@@ -333,6 +380,36 @@ class State:
             self.lockouts[source] = now + lockout_duration
             return True
         return False
+
+    def owed_trigger_actions(self, keys: list[str], now: datetime) -> list[str]:
+        """The on_trigger action keys due to run now.
+
+        Owed means TRIGGERED with no successful run in this trigger episode;
+        due means any retry backoff has elapsed.
+        """
+        if self.status != Status.TRIGGERED:
+            return []
+        records = self.trigger_actions if self.trigger_episode == self.trigger_time else {}
+        return [
+            key for key in keys
+            if (rec := records.get(key)) is None
+            or (not rec.done and (rec.retry_at is None or rec.retry_at <= now))
+        ]
+
+    def record_trigger_action(self, key: str, succeeded: bool, now: datetime) -> None:
+        """Record one attempt at on_trigger action `key` in the current episode.
+
+        A failure schedules the next attempt with exponential backoff.
+        """
+        if self.trigger_episode != self.trigger_time:
+            self.trigger_episode = self.trigger_time
+            self.trigger_actions = {}
+        rec = self.trigger_actions.setdefault(key, TriggerActionState())
+        rec.attempts += 1
+        rec.done = succeeded
+        rec.retry_at = None if succeeded else now + min(
+            TRIGGER_RETRY_BASE * 2 ** (rec.attempts - 1), TRIGGER_RETRY_MAX,
+        )
 
     def mark_schedule_item_run(self, name: str, period: str) -> None:
         """Mark a scheduled item as having run for a given period."""

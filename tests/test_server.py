@@ -1,5 +1,7 @@
 """Tests for the HTTP server endpoints."""
 
+from html.parser import HTMLParser
+
 import pytest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
@@ -84,6 +86,26 @@ async def get_csrf_token(client) -> str:
     resp = await client.get("/checkin")
     cookies = {c.key: c for c in resp.cookies.values()}
     return cookies["csrf_token"].value
+
+
+class _HiddenInputs(HTMLParser):
+    """Collect <input type="hidden"> name/value pairs from a page."""
+
+    def __init__(self):
+        super().__init__()
+        self.values: dict[str, str] = {}
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "input" and a.get("type") == "hidden":
+            self.values[a.get("name", "")] = a.get("value") or ""
+
+
+def form_csrf_token(html: str) -> str:
+    """The csrf_token a browser would submit from the form on this page."""
+    parser = _HiddenInputs()
+    parser.feed(html)
+    return parser.values["csrf_token"]
 
 
 class TestHealthEndpoint:
@@ -421,6 +443,22 @@ class TestSyncCheckin:
         data = await resp.json()
         assert data["success"] is True
         assert state_manager.state.status == Status.ARMED
+
+    @pytest.mark.asyncio
+    async def test_peer_checkin_keeps_local_lockouts(self, client, state_manager):
+        """A check-in relayed from a peer must not lift a lockout on this node."""
+        state_manager.state.lockouts = {
+            "1.2.3.4": datetime.now(timezone.utc) + timedelta(minutes=10)
+        }
+        timestamp = datetime.now(timezone.utc).isoformat()
+
+        resp = await client.post(
+            "/sync/checkin",
+            json={"timestamp": timestamp, "signature": sign_message(SECRET, f"checkin:{timestamp}")},
+        )
+
+        assert resp.status == 200
+        assert state_manager.state.is_locked_out("1.2.3.4")
 
     @pytest.mark.asyncio
     async def test_invalid_signature_returns_401(self, client):
@@ -1247,6 +1285,51 @@ class TestCSRFProtection:
 
         # Should NOT be 403 (may be 401 for bad TOTP, that's fine)
         assert resp.status != 403
+
+    @pytest.mark.asyncio
+    async def test_retry_after_invalid_code_is_accepted(self, client):
+        """A mistyped code must not break the form: the corrected submit from the
+        re-rendered page succeeds instead of failing CSRF validation."""
+        csrf = await get_csrf_token(client)
+        bad = await client.post("/checkin", data={"totp": "000000", "csrf_token": csrf})
+        assert "Invalid code" in await bad.text()
+
+        retry_token = form_csrf_token(await bad.text())
+        resp = await client.post(
+            "/checkin", data={"totp": generate_totp(), "csrf_token": retry_token},
+        )
+
+        assert resp.status == 200
+        assert "Check-in successful" in await resp.text()
+
+    @pytest.mark.asyncio
+    async def test_retry_after_missing_code_is_accepted(self, client):
+        """Submitting an empty form (AuthError path) also re-renders a usable form."""
+        csrf = await get_csrf_token(client)
+        bad = await client.post("/checkin", data={"csrf_token": csrf})
+
+        retry_token = form_csrf_token(await bad.text())
+        resp = await client.post(
+            "/checkin", data={"totp": generate_totp(), "csrf_token": retry_token},
+        )
+
+        assert resp.status == 200
+        assert "Check-in successful" in await resp.text()
+
+    @pytest.mark.asyncio
+    async def test_form_after_successful_checkin_is_submittable(self, client):
+        """The form shown after a successful check-in can be used to check in again."""
+        csrf = await get_csrf_token(client)
+        first = await client.post("/checkin", data={"totp": generate_totp(), "csrf_token": csrf})
+        assert "Check-in successful" in await first.text()
+
+        again = await client.post(
+            "/checkin",
+            data={"totp": generate_totp(), "csrf_token": form_csrf_token(await first.text())},
+        )
+
+        assert again.status == 200
+        assert "Check-in successful" in await again.text()
 
     @pytest.mark.asyncio
     async def test_json_api_bypasses_csrf(self, client):

@@ -83,12 +83,14 @@ class Watchdog:
         on_warning: Callable[[], Awaitable[None]] | None = None,
         on_grace: Callable[[], Awaitable[None]] | None = None,
         on_trigger: Callable[[], Awaitable[None]] | None = None,
+        while_triggered: Callable[[], Awaitable[None]] | None = None,
     ):
         self.config = config
         self.state_manager = state_manager
         self._on_warning = on_warning
         self._on_grace = on_grace
         self._on_trigger = on_trigger
+        self._while_triggered = while_triggered
         self._task: asyncio.Task | None = None
         self._running = False
 
@@ -232,11 +234,26 @@ class Watchdog:
         logger.info("Check-in accepted, timer reset")
         return True
 
+    async def tick(self) -> None:
+        """One watchdog cycle: advance the state machine, then, if the node is
+        already TRIGGERED, call `while_triggered` so owed trigger actions get
+        settled whichever way the node got here (peer broadcast, startup merge,
+        restart after a crash). Skipped on the tick that fires the TRIGGERED
+        transition itself, because on_trigger has just handled it.
+        """
+        transitioned = await self.check_and_transition()
+        if (transitioned is None and self.state.status == Status.TRIGGERED
+                and self._while_triggered):
+            try:
+                await self._while_triggered()
+            except Exception as e:
+                logger.exception(f"Error settling trigger actions: {e}")
+
     async def _run_loop(self) -> None:
         """Main watchdog loop."""
         try:
             while self._running:
-                await self.check_and_transition()
+                await self.tick()
                 await asyncio.sleep(self._check_interval)
         except asyncio.CancelledError:
             logger.info("Watchdog loop cancelled")

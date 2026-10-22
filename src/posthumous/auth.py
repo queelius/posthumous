@@ -185,7 +185,7 @@ class Authenticator:
             )
 
         if success and state:
-            state.clear_auth_failures()
+            state.clear_auth_failures(source)
 
         return success
 

@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from posthumous.state import (
+    TRIGGER_RETRY_MAX,
     State,
     StateManager,
     Status,
@@ -36,15 +37,30 @@ class TestState:
         assert state.last_checkin == now
         assert state.status == Status.ARMED
 
-    def test_record_checkin_clears_failures(self):
+    def test_record_checkin_keeps_lockouts(self):
+        """A check-in (local or relayed from a peer) proves the owner is alive; it
+        says nothing about an attacker's source, so it must not lift its lockout."""
         state = State()
-        state.record_failed_attempt("test")
-        state.record_failed_attempt("test")
+        for _ in range(5):
+            state.record_failed_attempt("1.2.3.4")
+        state.check_and_set_lockout(5, timedelta(minutes=15), "1.2.3.4")
 
         state.record_checkin()
 
-        assert len(state.failed_attempts) == 0
-        assert state.lockouts == {}
+        assert state.is_locked_out("1.2.3.4")
+        assert len(state.failed_attempts) == 5
+
+    def test_clear_auth_failures_is_per_source(self):
+        state = State()
+        for _ in range(5):
+            state.record_failed_attempt("1.2.3.4")
+        state.check_and_set_lockout(5, timedelta(minutes=15), "1.2.3.4")
+        state.record_failed_attempt("10.0.0.9")
+
+        state.clear_auth_failures("10.0.0.9")
+
+        assert [a.source for a in state.failed_attempts] == ["1.2.3.4"] * 5
+        assert state.is_locked_out("1.2.3.4")
 
     def test_transition_armed_to_warning(self):
         state = State()
@@ -603,3 +619,84 @@ class TestStateFilePermissions:
         assert mode == 0o600
 
 
+
+
+
+class TestTriggerActionDebt:
+    """A TRIGGERED node owes each on_trigger action (by key) until it has
+    succeeded once in the current trigger episode, however it got TRIGGERED."""
+
+    T = datetime(2026, 3, 1, 12, 0, tzinfo=timezone.utc)
+
+    def _triggered(self, trigger_time=None):
+        return State(status=Status.TRIGGERED, trigger_time=trigger_time or self.T)
+
+    def test_untriggered_node_owes_nothing(self):
+        assert State().owed_trigger_actions(["a", "b"], self.T) == []
+
+    def test_triggered_node_owes_every_action(self):
+        assert self._triggered().owed_trigger_actions(["a", "b"], self.T) == ["a", "b"]
+
+    def test_succeeded_action_is_no_longer_owed(self):
+        state = self._triggered()
+        state.record_trigger_action("a", succeeded=True, now=self.T)
+        assert state.owed_trigger_actions(["a", "b"], self.T) == ["b"]
+
+    def test_failed_action_waits_for_backoff(self):
+        state = self._triggered()
+        state.record_trigger_action("a", succeeded=False, now=self.T)
+
+        assert state.owed_trigger_actions(["a"], self.T + timedelta(seconds=59)) == []
+        assert state.owed_trigger_actions(["a"], self.T + timedelta(seconds=60)) == ["a"]
+
+    def test_backoff_doubles_and_is_capped(self):
+        state = self._triggered()
+        now = self.T
+        delays = []
+        for _ in range(12):
+            state.record_trigger_action("a", succeeded=False, now=now)
+            delay = state.trigger_actions["a"].retry_at - now
+            delays.append(delay)
+            now += delay
+        assert delays[:4] == [timedelta(minutes=m) for m in (1, 2, 4, 8)]
+        assert delays[-1] == TRIGGER_RETRY_MAX
+
+    def test_new_trigger_episode_owes_everything_again(self):
+        """Records belong to one trigger; a node that left TRIGGERED (recover /
+        import) and later re-triggers must run its actions again."""
+        state = self._triggered()
+        state.record_trigger_action("a", succeeded=True, now=self.T)
+
+        state.trigger_time = self.T + timedelta(days=90)
+
+        assert state.owed_trigger_actions(["a"], self.T + timedelta(days=90)) == ["a"]
+
+    def test_records_survive_save_and_load(self, tmp_path):
+        path = tmp_path / "state.yaml"
+        state = self._triggered()
+        state.record_trigger_action("a", succeeded=True, now=self.T)
+        state.record_trigger_action("b", succeeded=False, now=self.T)
+        state.save(path)
+
+        loaded = State.load(path)
+
+        assert loaded.owed_trigger_actions(["a", "b"], self.T) == []
+        assert loaded.owed_trigger_actions(["a", "b"], self.T + timedelta(minutes=1)) == ["b"]
+
+    def test_legacy_triggered_state_owes_every_action(self):
+        """Older versions never ran on_trigger on peer-adopted or crashed nodes,
+        so an upgrade owes the actions: a possible duplicate, never silence."""
+        state = State.from_dict({
+            "status": "triggered",
+            "trigger_time": "2026-01-01T00:00:00+00:00",
+        })
+        assert state.owed_trigger_actions(["a"], self.T) == ["a"]
+
+    def test_malformed_records_are_ignored_and_owed(self):
+        state = State.from_dict({
+            "status": "triggered",
+            "trigger_time": "2026-03-01T12:00:00+00:00",
+            "trigger_episode": "2026-03-01T12:00:00+00:00",
+            "trigger_actions": {"a": "garbage", "b": {"done": True, "attempts": 1}},
+        })
+        assert state.owed_trigger_actions(["a", "b"], self.T) == ["a"]

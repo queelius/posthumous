@@ -178,6 +178,21 @@ class TestAuthenticator:
         # Note: failures are cleared by state.record_checkin(), not by Authenticator
         # This tests that successful auth works even with prior failures
 
+    def test_success_clears_only_the_authenticating_source(self):
+        """The owner authenticating from one address must not hand a locked-out
+        attacker on another address a fresh batch of guesses."""
+        auth = Authenticator(generate_secret(), api_token="valid-token", max_attempts=5)
+        state = State()
+        for _ in range(5):
+            auth.verify(code="000000", state=state, source="1.2.3.4")
+        assert state.is_locked_out("1.2.3.4")
+        auth.verify(code="000000", state=state, source="10.0.0.9")
+
+        assert auth.verify(token="valid-token", state=state, source="10.0.0.9") is True
+
+        assert state.is_locked_out("1.2.3.4")
+        assert [a.source for a in state.failed_attempts] == ["1.2.3.4"] * 5
+
     def test_api_token_success_clears_failed_attempts(self):
         auth = Authenticator(secret="JBSWY3DPEHPK3PXP", api_token="valid-token")
         state = State()

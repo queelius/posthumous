@@ -244,6 +244,8 @@ ARMED ──timeout──► WARNING ──timeout──► GRACE ──timeout�
 | **GRACE** | Final warning. Fires `on_grace` actions. Check-in still resets to ARMED. |
 | **TRIGGERED** | Terminal state. Fires `on_trigger` actions. No check-in can undo it. Post-trigger scheduler starts. |
 
+Every node that becomes TRIGGERED runs its own `on_trigger` actions, whether it fired on its own timer, accepted a peer's trigger broadcast, or picked up the trigger from peers at startup. A failed action is retried with exponential backoff (1 minute, doubling, capped at 6 hours) until it succeeds; actions that already succeeded are not repeated, including across restarts. Actions are identified by their content, so if you edit `on_trigger` after a trigger, new or changed actions run and unchanged ones that already succeeded are not re-sent.
+
 If a node is offline and misses intermediate states (e.g., goes from ARMED straight to TRIGGERED), the watchdog fires all intermediate callbacks in order before reaching the current state.
 
 ## Scheduling DSL
@@ -567,7 +569,7 @@ Posthumous uses RFC 6238 TOTP with 6-digit codes and a 30-second time step. The 
 
 After `max_failed_attempts` (default: 5) failed authentication attempts within `lockout_duration` (default: 15 minutes), the node locks out further attempts for `lockout_duration`.
 
-Lockout is **per source** (keyed on the client address, or `cli` for local check-ins), so a flood of bad codes from one address cannot lock out the legitimate owner checking in from another. A successful check-in clears every source's lockout. One caveat: sources that share an address (clients behind a reverse proxy that does not forward the real client IP, NAT, or all local traffic on a loopback bind) share a single lockout bucket. Honoring a trusted `X-Forwarded-For` for proxied deployments is a future direction; until then, an attacker sharing your apparent source can still lock that bucket (recover with `phm checkin` from the host, which uses the `cli` source, or `phm reset`).
+Lockout is **per source** (keyed on the client address, or `cli` for local check-ins), so a flood of bad codes from one address cannot lock out the legitimate owner checking in from another. A successful authentication clears only that source's failed attempts and lockout; a check-in from elsewhere (including one relayed by a peer) leaves other sources' lockouts in place. One caveat: sources that share an address (clients behind a reverse proxy that does not forward the real client IP, NAT, or all local traffic on a loopback bind) share a single lockout bucket. Honoring a trusted `X-Forwarded-For` for proxied deployments is a future direction; until then, an attacker sharing your apparent source can still lock that bucket (recover with `phm checkin` from the host, which uses the `cli` source, or `phm reset`).
 
 ### API Token
 

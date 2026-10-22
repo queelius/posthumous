@@ -237,9 +237,10 @@ class TestRunComponents:
         mock_scheduler = _make_mock_scheduler()
         mock_peer_mgr = _make_mock_peer_manager()
         mock_notif_mgr = MagicMock()
-        mock_notif_mgr.send = AsyncMock()
+        # Trigger actions record each result, so return real-shaped results.
+        mock_notif_mgr.send = AsyncMock(return_value=MagicMock(success=True))
         mock_script_runner = MagicMock()
-        mock_script_runner.run = AsyncMock()
+        mock_script_runner.run = AsyncMock(return_value=MagicMock(success=True))
 
         captured_on_trigger = None
 
@@ -251,6 +252,15 @@ class TestRunComponents:
         async def wait_and_call_trigger(*args, **kwargs):
             if captured_on_trigger:
                 await captured_on_trigger()
+
+        # on_trigger fires after the watchdog has moved the node to TRIGGERED;
+        # a current-format state file owes every on_trigger action.
+        import yaml
+        (config_path.parent / "state.yaml").write_text(yaml.dump({
+            "status": "triggered",
+            "trigger_time": datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc).isoformat(),
+            "trigger_actions_done": [],
+        }))
 
         with patch('posthumous.runner.Server', return_value=mock_server), \
              patch('posthumous.runner.Watchdog', side_effect=capture_watchdog), \

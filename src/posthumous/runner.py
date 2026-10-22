@@ -14,10 +14,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from posthumous.auth import Authenticator
-from posthumous.config import Config, NotificationAction, ScriptAction
+from posthumous.config import Config, NotificationAction, ScriptAction, action_keys
 from posthumous.notifications import NotificationManager, build_context
 from posthumous.peers import PeerManager
 from posthumous.scheduler import Scheduler, ScheduledExecution
@@ -131,13 +131,15 @@ class DaemonRunner:
             on_peer_down=self.on_peer_down,
         )
 
-        # Watchdog fires on_warning / on_grace / on_trigger as state transitions
+        # Watchdog fires on_warning / on_grace / on_trigger as state transitions,
+        # and keeps settling owed trigger actions on every tick while TRIGGERED.
         self.watchdog = Watchdog(
             config,
             self.state_manager,
             on_warning=self.on_warning,
             on_grace=self.on_grace,
             on_trigger=self.on_trigger,
+            while_triggered=self.settle_trigger_actions,
         )
 
         # Scheduler fires on_scheduled_complete after each scheduled action
@@ -158,22 +160,14 @@ class DaemonRunner:
             self.peer_manager,
         )
 
-    async def execute_actions(
+    def _action_context(
         self,
-        event: str,
         status: str,
-        title: str,
-        actions: list,
         trigger_time: datetime | None = None,
         extra_context: dict[str, str] | None = None,
-    ) -> None:
-        """Execute a list of notification and script actions."""
+    ) -> dict:
+        """Template variables available to notification messages."""
         assert self.state_manager is not None, "build_components() must be called first"
-        assert self.notification_manager is not None
-        assert self.script_runner is not None
-
-        logger.info(f"{title} - executing actions")
-
         config = self.config
         context = build_context(
             node_name=config.node_name,
@@ -188,24 +182,90 @@ class DaemonRunner:
         )
         if extra_context:
             context.update(extra_context)
+        return context
 
+    async def _run_action(
+        self,
+        action: NotificationAction | ScriptAction,
+        event: str,
+        status: str,
+        title: str,
+        context: dict,
+        trigger_time: datetime | None = None,
+    ) -> bool:
+        """Run one notification or script action. Returns True on success."""
+        assert self.state_manager is not None
+        assert self.notification_manager is not None
+        assert self.script_runner is not None
+
+        if isinstance(action, NotificationAction):
+            result = await self.notification_manager.send(
+                action.channel,
+                action.message,
+                title=title,
+                context=context,
+            )
+            return result.success
+        script_context = ScriptContext(
+            event=event,
+            trigger_time=trigger_time,
+            node_name=self.config.node_name,
+            status=status,
+            last_checkin=self.state_manager.state.last_checkin,
+        )
+        result = await self.script_runner.run(action.script, script_context)
+        return result.success
+
+    async def execute_actions(
+        self,
+        event: str,
+        status: str,
+        title: str,
+        actions: list,
+        trigger_time: datetime | None = None,
+        extra_context: dict[str, str] | None = None,
+    ) -> None:
+        """Execute a list of notification and script actions."""
+        logger.info(f"{title} - executing actions")
+        context = self._action_context(status, trigger_time, extra_context)
         for action in actions:
-            if isinstance(action, NotificationAction):
-                await self.notification_manager.send(
-                    action.channel,
-                    action.message,
-                    title=title,
-                    context=context,
+            await self._run_action(action, event, status, title, context, trigger_time)
+
+    async def settle_trigger_actions(self) -> None:
+        """Run every on_trigger action this node owes and is due, recording each attempt.
+
+        A TRIGGERED node owes each action until it succeeds once in the current
+        trigger episode, however it became TRIGGERED. A failed action stays owed
+        and is retried with exponential backoff (a duplicate attempt, never
+        silence); every attempt is persisted immediately so a success is not
+        repeated after a restart. Actions are identified by content
+        (config.action_keys), so editing on_trigger after the trigger runs the
+        new or changed actions without repeating ones that already succeeded.
+        """
+        assert self.state_manager is not None
+        state = self.state_manager.state
+        actions = self.config.on_trigger
+        keys = action_keys(actions)
+        due = set(state.owed_trigger_actions(keys, datetime.now(timezone.utc)))
+        if not due:
+            return
+
+        title = "Posthumous Activated"
+        logger.info(f"{title} - executing {len(due)} owed trigger action(s)")
+        context = self._action_context("triggered", state.trigger_time)
+        for action, key in zip(actions, keys):
+            if key not in due:
+                continue
+            succeeded = await self._run_action(
+                action, "trigger", "triggered", title, context, state.trigger_time,
+            )
+            state.record_trigger_action(key, succeeded, datetime.now(timezone.utc))
+            self.state_manager.save()
+            if not succeeded:
+                logger.warning(
+                    f"on_trigger action {action} failed; "
+                    f"retrying at {state.trigger_actions[key].retry_at}"
                 )
-            elif isinstance(action, ScriptAction):
-                script_context = ScriptContext(
-                    event=event,
-                    trigger_time=trigger_time,
-                    node_name=config.node_name,
-                    status=status,
-                    last_checkin=self.state_manager.state.last_checkin,
-                )
-                await self.script_runner.run(action.script, script_context)
 
     # ------------------------------------------------------------------
     # State-transition callbacks (passed to Watchdog / PeerManager / Scheduler)
@@ -237,13 +297,7 @@ class DaemonRunner:
                 self.state_manager.state.trigger_time,
             )
 
-        await self.execute_actions(
-            "trigger",
-            "triggered",
-            "Posthumous Activated",
-            self.config.on_trigger,
-            self.state_manager.state.trigger_time,
-        )
+        await self.settle_trigger_actions()
 
     async def on_peer_down(
         self,

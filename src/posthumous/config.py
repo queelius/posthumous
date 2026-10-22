@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import secrets
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -65,6 +67,25 @@ class NotificationAction:
 class ScriptAction:
     """An action that runs a script."""
     script: str  # Path to script (relative to config dir or absolute)
+
+
+def action_keys(actions: list[NotificationAction | ScriptAction]) -> list[str]:
+    """A stable identity for each action, derived from its content.
+
+    The key is a digest of the action's type and fields, so it follows the
+    action when the list is reordered and changes when the action is edited
+    (an edited action is a new obligation). The nth identical action gets a
+    `#n` suffix so duplicates stay distinct.
+    """
+    seen: dict[str, int] = {}
+    keys = []
+    for action in actions:
+        canonical = json.dumps({"type": type(action).__name__, **asdict(action)}, sort_keys=True)
+        digest = hashlib.sha256(canonical.encode()).hexdigest()[:16]
+        occurrence = seen.get(digest, 0)
+        seen[digest] = occurrence + 1
+        keys.append(f"{digest}#{occurrence}")
+    return keys
 
 
 @dataclass

@@ -283,7 +283,12 @@ class Server:
         """Generate a CSRF token for double-submit cookie protection."""
         return secrets.token_hex(32)
 
-    def _get_form_html(self, csrf_token: str = "", source: str | None = None) -> str:
+    @staticmethod
+    def _request_source(request: web.Request) -> str:
+        """The identifier a requester's failed attempts and lockout are keyed by."""
+        return request.remote or "unknown"
+
+    def _get_form_html(self, csrf_token: str, source: str) -> str:
         """Get the appropriate form HTML based on current state.
 
         `source` is the requester's address so the lockout form is shown only to
@@ -339,8 +344,14 @@ class Server:
             return None, "Invalid signature"
         return msg_time, None
 
-    def _render_checkin_page(self, message: str, form_html: str) -> web.Response:
-        """Render the check-in page for the current status."""
+    def _render_checkin_page(self, source: str, message: str = "") -> web.Response:
+        """Render the check-in page for the current status and this requester.
+
+        Every render issues a fresh CSRF token and matching cookie, so whatever
+        form the page shows (first visit, after a failed attempt, after a
+        check-in) can actually be submitted.
+        """
+        csrf_token = self._generate_csrf_token()
         status = self.state_manager.state.status.value
         html = CHECKIN_HTML.format(
             status=status.upper(),
@@ -348,9 +359,11 @@ class Server:
             time_info=self._get_time_info(),
             node_name=self.config.node_name,
             message=message,
-            form_html=form_html,
+            form_html=self._get_form_html(csrf_token, source),
         )
-        return web.Response(text=html, content_type='text/html')
+        response = web.Response(text=html, content_type='text/html')
+        response.set_cookie('csrf_token', csrf_token, httponly=True, samesite='Strict')
+        return response
 
     async def handle_index(self, request: web.Request) -> web.Response:
         """Redirect to check-in form."""
@@ -358,13 +371,7 @@ class Server:
 
     async def handle_checkin_form(self, request: web.Request) -> web.Response:
         """Render check-in form."""
-        csrf_token = self._generate_csrf_token()
-        response = self._render_checkin_page(
-            "",
-            self._get_form_html(csrf_token, source=request.remote),
-        )
-        response.set_cookie('csrf_token', csrf_token, httponly=True, samesite='Strict')
-        return response
+        return self._render_checkin_page(self._request_source(request))
 
     async def handle_dashboard(self, request: web.Request) -> web.Response:
         """Render the dashboard page."""
@@ -487,7 +494,7 @@ class Server:
                 )
 
         # Get client identifier for rate limiting
-        client_ip = request.remote or "unknown"
+        client_ip = self._request_source(request)
 
         # Authenticate
         try:
@@ -503,20 +510,14 @@ class Server:
                     {'success': False, 'error': str(e)},
                     status=429,
                 )
-            return self._render_checkin_page(
-                f'<div class="message error">{e}</div>',
-                self._LOCKOUT_HTML,
-            )
+            return self._render_checkin_page(client_ip, f'<div class="message error">{e}</div>')
         except AuthError as e:
             if content_type == 'application/json':
                 return web.json_response(
                     {'success': False, 'error': str(e)},
                     status=400,
                 )
-            return self._render_checkin_page(
-                f'<div class="message error">{e}</div>',
-                self._get_form_html(source=client_ip),
-            )
+            return self._render_checkin_page(client_ip, f'<div class="message error">{e}</div>')
 
         if not success:
             self.state_manager.save()
@@ -527,8 +528,7 @@ class Server:
                     status=401,
                 )
             return self._render_checkin_page(
-                '<div class="message error">Invalid code. Please try again.</div>',
-                self._get_form_html(source=client_ip),
+                client_ip, '<div class="message error">Invalid code. Please try again.</div>',
             )
 
         # Process check-in
@@ -541,8 +541,8 @@ class Server:
                     status=409,
                 )
             return self._render_checkin_page(
+                client_ip,
                 '<div class="message error">Node is already triggered. Check-in rejected.</div>',
-                self._TRIGGERED_HTML,
             )
 
         # Broadcast to peers
@@ -559,8 +559,7 @@ class Server:
             })
 
         return self._render_checkin_page(
-            '<div class="message success">Check-in successful!</div>',
-            self._get_form_html(),
+            client_ip, '<div class="message success">Check-in successful!</div>',
         )
 
     async def handle_status(self, request: web.Request) -> web.Response:
