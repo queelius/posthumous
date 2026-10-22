@@ -9,7 +9,6 @@ from posthumous.crypto import (
     encrypt,
     decrypt,
     is_encrypted,
-    encrypt_file,
     decrypt_file,
     save_encrypted,
     ENCRYPTED_MAGIC_V1,
@@ -302,37 +301,10 @@ class TestV1MigrationAtomicFailure:
 class TestFileEncryption:
     """Tests for file-level encryption operations (secret-based API)."""
 
-    def test_encrypt_file_in_place(self, tmp_path):
-        """encrypt_file should encrypt a plaintext file in place."""
-        file_path = tmp_path / "test.yaml"
-        file_path.write_text("secret: data\n")
-
-        encrypt_file(file_path, "test-secret")
-
-        raw = file_path.read_bytes()
-        assert is_encrypted(raw)
-        assert raw.startswith(ENCRYPTED_MAGIC_V2)
-        assert decrypt(raw, secret="test-secret") == "secret: data\n"
-
-    def test_encrypt_file_idempotent(self, tmp_path):
-        """encrypt_file on already-encrypted file is a no-op."""
-        file_path = tmp_path / "test.yaml"
-        file_path.write_text("secret: data\n")
-
-        encrypt_file(file_path, "test-secret")
-        first_content = file_path.read_bytes()
-
-        encrypt_file(file_path, "test-secret")  # Should not re-encrypt
-        second_content = file_path.read_bytes()
-
-        assert first_content == second_content
-
     def test_decrypt_file_encrypted(self, tmp_path):
         """decrypt_file should decrypt an encrypted file."""
         file_path = tmp_path / "test.yaml"
-        file_path.write_text("secret: data\n")
-
-        encrypt_file(file_path, "test-secret")
+        save_encrypted(file_path, "secret: data\n", "test-secret")
         content = decrypt_file(file_path, "test-secret")
         assert content == "secret: data\n"
 
@@ -363,20 +335,6 @@ class TestFileEncryption:
         assert file_path.exists()
         assert decrypt_file(file_path, "test-secret") == "content"
 
-    def test_encrypt_file_atomic_failure(self, tmp_path):
-        """If os.replace fails, temp file should be cleaned up."""
-        from unittest.mock import patch
-
-        file_path = tmp_path / "test.yaml"
-        file_path.write_text("secret: data\n")
-
-        with patch('os.replace', side_effect=OSError("disk full")):
-            with pytest.raises(OSError, match="disk full"):
-                encrypt_file(file_path, "test-secret")
-
-        # Original file should be unchanged
-        assert file_path.read_text() == "secret: data\n"
-
 
 class TestSaveEncryptedAtomicFailure:
     """Tests for save_encrypted exception handler paths."""
@@ -400,17 +358,6 @@ class TestSaveEncryptedAtomicFailure:
             with pytest.raises(OSError, match="disk full"):
                 save_encrypted(file_path, "content", "test-secret")
 
-    def test_encrypt_file_atomic_failure_unlink_fails(self, tmp_path):
-        """If both os.replace and os.unlink fail in encrypt_file."""
-        from unittest.mock import patch
-        file_path = tmp_path / "test.yaml"
-        file_path.write_text("secret: data\n")
-
-        with patch('os.replace', side_effect=OSError("disk full")), \
-             patch('os.unlink', side_effect=OSError("permission denied")):
-            with pytest.raises(OSError, match="disk full"):
-                encrypt_file(file_path, "test-secret")
-
 
 class TestCryptoFilePermissions:
     """Tests for restrictive file permissions on encrypted files."""
@@ -419,13 +366,5 @@ class TestCryptoFilePermissions:
         import stat
         path = tmp_path / "test.yaml"
         save_encrypted(path, "hello: world", "JBSWY3DPEHPK3PXP")
-        mode = stat.S_IMODE(path.stat().st_mode)
-        assert mode == 0o600
-
-    def test_encrypt_file_sets_restrictive_permissions(self, tmp_path):
-        import stat
-        path = tmp_path / "test.yaml"
-        path.write_text("hello: world")
-        encrypt_file(path, "JBSWY3DPEHPK3PXP")
         mode = stat.S_IMODE(path.stat().st_mode)
         assert mode == 0o600

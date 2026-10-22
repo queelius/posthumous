@@ -193,14 +193,6 @@ class TestAuthenticator:
         assert len(state.failed_attempts) == 0
         assert state.lockouts == {}
 
-    def test_get_current_code(self):
-        secret = generate_secret()
-        auth = Authenticator(secret)
-
-        code = auth.get_current_code()
-        assert len(code) == 6
-        assert code.isdigit()
-
 
 class TestQRCode:
     """Tests for QR code generation."""
@@ -225,32 +217,6 @@ class TestQRCode:
         # Should be a multi-line string with block characters
         assert "\n" in qr
         assert any(c in qr for c in "█▀▄")
-
-    def test_qr_code_image(self):
-        from posthumous.auth import generate_qr_code
-
-        secret = "JBSWY3DPEHPK3PXP"
-        img_bytes = generate_qr_code(secret, "test-node")
-
-        # Should be PNG image data
-        assert img_bytes.startswith(b'\x89PNG')
-
-    def test_qr_code_image_missing_package(self):
-        """When qrcode package is not importable, should raise ImportError."""
-        from posthumous.auth import generate_qr_code
-        from unittest.mock import patch
-        import builtins
-
-        original_import = builtins.__import__
-
-        def mock_import(name, *args, **kwargs):
-            if name == "qrcode":
-                raise ImportError("mocked")
-            return original_import(name, *args, **kwargs)
-
-        with patch("builtins.__import__", side_effect=mock_import):
-            with pytest.raises(ImportError, match="qrcode"):
-                generate_qr_code("JBSWY3DPEHPK3PXP", "test-node")
 
     def test_qr_code_terminal_missing_package(self):
         """When qrcode package is not importable, should raise ImportError."""

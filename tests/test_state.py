@@ -88,12 +88,12 @@ class TestState:
     def test_schedule_item_tracking(self):
         state = State()
 
-        assert state.should_run_schedule_item("annual", "2026")
+        assert "annual" not in state.schedule_state
 
         state.mark_schedule_item_run("annual", "2026")
 
-        assert not state.should_run_schedule_item("annual", "2026")
-        assert state.should_run_schedule_item("annual", "2027")
+        assert state.schedule_state["annual"].period == "2026"
+        assert state.schedule_state["annual"].last_run is not None
 
     def test_lockout(self):
         state = State()

@@ -34,6 +34,8 @@ posthumous recover              # rebuild a corrupt state.yaml from a peer
 
 No linter is configured. Build system is Hatchling (`pyproject.toml`). Python 3.10+.
 
+The `dev` extra pins `aiohttp<3.11` because `aioresponses` 0.7.x breaks on newer aiohttp (`ClientResponse.__init__` gained a required kwarg). The runtime dependency is unpinned; only the test double is affected. If peer/server tests fail with mock-construction errors, check the installed aiohttp version first.
+
 ## Architecture
 
 Posthumous is a federated deadman switch. Users check in periodically via TOTP; if they stop, the system progresses through ARMED, WARNING, GRACE, TRIGGERED, sending notifications and running scripts at each stage. After trigger, a scheduler runs recurring post-trigger actions forever.
@@ -49,20 +51,21 @@ Runtime files live in `~/.posthumous/`: `config.yaml`, `state.yaml`, `scripts/`,
 
 ### Module Layers
 
-**Foundation** (no internal imports):
-- `config.py`: YAML config loading, duration parsing ("7 days", "12 hours"), validation. `Config` dataclass with `from_yaml()`, `to_dict()`, `validate()`.
-- `state.py`: atomic YAML persistence (temp file + `os.replace`), `Status` enum (`ARMED`, `WARNING`, `GRACE`, `TRIGGERED`), `StateManager` with lazy loading. `State` dataclass tracks check-ins, failures, peer states, schedule dedup. `PeerState.alerted_at` persists the peer-down notification guard across restarts. `transition()` enforces a `valid_transitions` table; anything else returns False without raising.
+**Foundation** (no internal imports other than `fileio`):
+- `fileio.py`: `atomic_write(path, data, prefix)`, the one crash-safe write (same-dir `mkstemp` + `os.replace` + chmod 0600) used by config, state and encrypted saves.
+- `config.py`: YAML config loading, duration parsing ("7 days", "12 hours"), validation. `Config` dataclass with `from_yaml()`, `to_dict()`, `validate()`. Per-event action lists are the `ACTION_EVENTS` fields; parse/serialize/validate loop over that tuple, so a new `on_*` event is one tuple entry plus the dataclass field. The default notification channel is a per-install random ntfy topic (`ntfy://posthumous-<hex>`), never a shared guessable one.
+- `state.py`: atomic YAML persistence (temp file + `os.replace`), `Status` enum (`ARMED`, `WARNING`, `GRACE`, `TRIGGERED`), `StateManager` with lazy loading; build it with `StateManager.for_config(config)` rather than hand-joining `state.yaml`. `State` dataclass tracks check-ins, failures, peer states, schedule dedup. `PeerState.alerted_at` persists the peer-down notification guard across restarts. `transition_to()` enforces the module-level `VALID_TRANSITIONS` table; anything else returns False without raising.
 - `dsl.py`: when-expression parser for scheduling. `ScheduleType` enum covers trigger-relative, recurring, anniversary, absolute-once, absolute-recurring. Key functions: `parse_when_expression()`, `get_next_occurrence()`, `should_execute()`, `get_period_key()`.
 - `notifications.py`: Apprise wrapper with retry logic (3x, 5s between). Template formatting with `{days_left}`, `{hours_left}`, `{node_name}`, `{healthy_peers}`, `{total_peers}`, `{dead_peers}`. Runs Apprise via `run_in_executor` (sync library).
 - `scripts.py`: async subprocess execution. `ScriptContext` exports `POSTHUMOUS_*` env vars and creates a temp JSON context file (auto-cleaned). 300s default timeout.
-- `auth.py`: TOTP via pyotp, API token verification, HMAC-SHA256 message signing for peer auth (`sign_message` / `verify_signature`), brute-force lockout tracking. `Authenticator` class, `LockedOutError` / `AuthError` exceptions.
-- `crypto.py`: encryption at rest for `config.yaml` and `state.yaml`. PBKDF2-HMAC-SHA256 (600k iterations, 16-byte random salt) wraps a Fernet key. Two on-disk formats: `PHM_ENC_v1` (legacy bare SHA-256 KDF) and `PHM_ENC_v2` (PBKDF2 with embedded salt). `decrypt_file()` auto-migrates v1 to v2 on read. All writes go through atomic `mkstemp` + `os.replace`.
+- `auth.py`: TOTP via pyotp, API token verification, HMAC-SHA256 message signing for peer auth (`sign_message` / `verify_signature`; `sync_message(kind, ts, *fields)` defines the signed string for every sync message, used by both `peers.py` and `server.py`), brute-force lockout tracking. `Authenticator` class, `LockedOutError` / `AuthError` exceptions. Lockout is per-source (`State.lockouts: dict[source, until]`, keyed by `request.remote`) so a remote flood cannot lock out the local owner; legacy scalar `lockout_until` in old state files is dropped on load.
+- `crypto.py`: encryption at rest for `state.yaml` only (`config.yaml` stays plaintext). PBKDF2-HMAC-SHA256 (600k iterations, 16-byte random salt) wraps a Fernet key. Two on-disk formats: `PHM_ENC_v1` (legacy bare SHA-256 KDF) and `PHM_ENC_v2` (PBKDF2 with embedded salt). `decrypt_file()` auto-migrates v1 to v2 on read. All writes go through atomic `mkstemp` + `os.replace`.
 
 **Integration** (compose foundation modules):
-- `watchdog.py`: async timer loop (60s check interval). `_transition_through(*statuses)` fires callbacks in sequence when catching up after downtime; the path to TRIGGERED is `WARNING -> GRACE -> TRIGGERED` without intermediate consensus.
-- `scheduler.py`: post-trigger action engine. Parses when-expressions via `dsl.py`, tracks execution with period-based dedup keys (e.g., "2026", "2026-W05"). Only runs when TRIGGERED.
+- `watchdog.py`: async timer loop. Interval is `config.check_interval` if set, else auto-tuned to a quarter of the shortest stage gap, clamped to [1s, 60s]. `_transition_through(*statuses)` fires callbacks in sequence when catching up after downtime; the path to TRIGGERED is `WARNING -> GRACE -> TRIGGERED` without intermediate consensus.
+- `scheduler.py`: post-trigger action engine. Parses when-expressions via `dsl.py`, tracks execution with period-based dedup keys (e.g., "2026", "2026-W05"). Only runs when TRIGGERED. A run is recorded and broadcast to peers as complete only on success; a failed action stays unmarked so this node retries and peers still run it themselves.
 - `peers.py`: HMAC-signed broadcasts to federated peers via `_broadcast_to_all()` (concurrent). Handles check-in sync, trigger propagation, scheduled item completion. `pick_best_peer()` chooses a healthy peer for state recovery. `merge_state_from_peers()` (v0.8) queries every peer and merges last_checkin / status / trigger_time / schedule_state on startup so a returning offline node does not false-fire from stale local state. Background `_health_check_once()` loop drives the peer-down alert path.
-- `server.py`: aiohttp server: dark-themed web check-in form (CSRF double-submit cookie), JSON API, peer sync endpoints (`/sync/checkin`, `/sync/trigger`, `/sync/scheduled`, `/sync/state`).
+- `server.py`: aiohttp server: dark-themed web check-in form (CSRF double-submit cookie), JSON API, peer sync endpoints (`/sync/checkin`, `/sync/trigger`, `/sync/scheduled`, `/sync/state`). Every sync endpoint goes through `_verify_sync_message()`: HMAC over `sync_message(kind, timestamp, *fields)` plus a freshness check against `SYNC_FRESHNESS_SECONDS` (900s, deliberately generous to tolerate clock skew between nodes; see the comment on the constant before tightening it).
 - `systemd.py`: sd_notify protocol (`READY=1`, `WATCHDOG=1`, `STOPPING=1`) over the `NOTIFY_SOCKET` Unix datagram socket. `generate_unit_file()` produces a user-mode `posthumous.service` unit (Type=notify, WatchdogSec=30); rejects paths containing whitespace because systemd's ExecStart parser has no shell-style quoting.
 - `runner.py`: `DaemonRunner` owns the async lifecycle. `attempt_state_recovery()` runs on every startup: full peer recovery if state.yaml is corrupt, otherwise `merge_state_from_peers()` to catch up on check-ins / triggers missed while offline. `build_components()` (wires state, notifications, scripts, auth, peers, watchdog, scheduler, server), `execute_actions()` (shared by the warning / grace / trigger / peer-down callbacks), and `run()` (signal handlers, sd_notify heartbeat task at 15s, ordered shutdown, PID file cleanup).
 
@@ -81,7 +84,7 @@ ARMED ──timeout──► WARNING ──timeout──► GRACE ──timeout�
                                                           (scheduler runs forever)
 ```
 
-`valid_transitions` (in `state.py`):
+`VALID_TRANSITIONS` (in `state.py`; the watchdog's catch-up path is derived from `Status` declaration order, so keep members in escalation order):
 
 ```
 ARMED     -> {WARNING}
@@ -96,13 +99,13 @@ Check-in is a separate reset path (ARMED from any non-TRIGGERED state). Direct A
 
 - **Atomic writes**: state uses `tempfile.mkstemp()` + `os.replace()` in the same directory for crash-safe persistence. The same pattern is used for encrypted files in `crypto.py`.
 - **Catch-up transitions**: if a node was offline and missed WARNING, the watchdog fires all intermediate callbacks in order before reaching the current state.
-- **Federation bias is suppression-resistance**: failure mode is duplicates (annoying) not silence (catastrophic). Any single node can fire the trigger independently; dedup keys prevent repeats on the same node. v0.8 deliberately removed the v0.7 quorum protocol because its fail-closed semantics worked against this property.
+- **Federation bias is suppression-resistance**: failure mode is duplicates (annoying) not silence (catastrophic). Any single node can fire the trigger independently; dedup keys prevent repeats on the same node. v0.8 deliberately removed the v0.7 quorum protocol because its fail-closed semantics worked against this property. Use this as the tiebreaker for any error path: when unsure, choose the behavior that degrades to a duplicate action rather than a suppressed one (e.g. reject a stale sync message, don't mark a failed action done).
 - **Startup peer-state pull**: every daemon startup queries peers and merges newer `last_checkin`, TRIGGERED status, and union of completed schedule periods. Closes the stale-state false-alarm window for a returning offline node.
 - **CLI prefers the daemon**: `phm checkin` POSTs to the running daemon's HTTP endpoint to keep state mutation and peer broadcast on a single code path. The direct fallback (when daemon is down) is intentional and preserves suppression-resistance.
 - **Async throughout**: watchdog, scheduler, peer health, and script execution all use asyncio. Apprise (synchronous) runs via `run_in_executor`. urllib (synchronous) is used for the CLI -> daemon HTTP call because the CLI is not async.
 - **UTC everywhere**: all timestamps use `datetime.now(timezone.utc)`. Time arithmetic uses `timedelta` and `dateutil.relativedelta` for month / year offsets in the DSL.
 - **Lifecycle ownership**: `runner.DaemonRunner` owns the event loop, components, and shutdown order. `cli.py` only deals with CLI-shaped concerns (argv, daemonization fork, stop signal, the daemon-or-direct routing decision). When adding a new background task or callback, wire it in `runner.py`, not `cli.py`.
-- **Encryption at rest**: opt-in via `encryption_secret` (or `secret_key` fallback). On-disk format is self-identifying via the `PHM_ENC_v*` magic header. Reading a v1 file rewrites it as v2 with a fresh salt, so a "read" is also a quiet write; mind file watchers in tests.
+- **Encryption at rest**: opt-in via the `encrypt_at_rest: true` config flag; the key material is `secret_key` (`Config.get_encryption_secret()`), the same secret used for TOTP and peer HMAC. On-disk format is self-identifying via the `PHM_ENC_v*` magic header. Reading a v1 file rewrites it as v2 with a fresh salt, so a "read" is also a quiet write; mind file watchers in tests.
 
 ### Test Conventions
 
@@ -111,7 +114,7 @@ Check-in is a separate reset path (ARMED from any non-TRIGGERED state). Direct A
 - Peer tests mock `aiohttp.ClientSession` (must use `AsyncMock` for `.close()`)
 - Time-dependent tests use `freezegun` to mock `datetime.now`
 - `aioresponses` mocks HTTP calls in peer / server tests. Mocks for endpoints called with query params (`/sync/state?ts=...&sig=...`) need `re.compile(...)` rather than a plain URL.
-- State-transition tests must respect `valid_transitions`: to test a TRIGGERED-state behavior, pre-set the state to GRACE first, then transition forward; direct ARMED to TRIGGERED is rejected by the state machine.
+- State-transition tests must respect `VALID_TRANSITIONS`: to test a TRIGGERED-state behavior, pre-set the state to GRACE first, then transition forward; direct ARMED to TRIGGERED is rejected by the state machine.
 - A few server / peer tests bind to a fixed port (8420) and can flake when run in parallel or under port contention. Prefer ephemeral ports (`listen="127.0.0.1:0"`) for new tests.
 - CLI checkin tests should mock `posthumous.cli._try_daemon_checkin` to control the daemon-up vs daemon-down branch deterministically.
 - Shared fixtures in `tests/conftest.py`: `tmp_config_dir` (creates `~/.posthumous/` structure in `tmp_path`), `sample_config_yaml` (writes a valid config file).

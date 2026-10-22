@@ -212,19 +212,12 @@ class Watchdog:
 
         logger.info(f"Transitioning from {current_status.value} to {expected_status.value}")
 
-        # Determine the transition path based on current and expected status
-        if expected_status == Status.WARNING:
-            return await self._transition_through(Status.WARNING)
-
-        if expected_status == Status.GRACE:
-            # May skip WARNING if we were down - transition through it first
-            return await self._transition_through(Status.WARNING, Status.GRACE)
-
-        if expected_status == Status.TRIGGERED:
-            # May skip WARNING and/or GRACE if we were down - transition through them.
-            return await self._transition_through(Status.WARNING, Status.GRACE, Status.TRIGGERED)
-
-        return None
+        # Walk every stage after ARMED up to the expected one, so a node that was
+        # down fires the callbacks it missed in order. Stages already passed are
+        # rejected by the state machine and skipped. An expected ARMED yields an
+        # empty path (no transition).
+        stages = list(Status)
+        return await self._transition_through(*stages[1:stages.index(expected_status) + 1])
 
     def checkin(self, timestamp: datetime | None = None) -> bool:
         """Process a check-in.
@@ -241,8 +234,6 @@ class Watchdog:
 
     async def _run_loop(self) -> None:
         """Main watchdog loop."""
-        logger.info("Watchdog started")
-
         try:
             while self._running:
                 await self.check_and_transition()

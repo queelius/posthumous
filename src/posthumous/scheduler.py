@@ -5,14 +5,14 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Callable, Awaitable
 
 from posthumous.config import Config, ScheduledItem
 from posthumous.dsl import parse_when_expression, should_execute, get_next_occurrence, ParsedSchedule
 from posthumous.notifications import NotificationManager, build_context
 from posthumous.scripts import ScriptRunner, ScriptContext
-from posthumous.state import StateManager, Status
+from posthumous.state import StateManager, Status, format_datetime
 
 logger = logging.getLogger(__name__)
 
@@ -63,44 +63,6 @@ class Scheduler:
     @property
     def state(self):
         return self.state_manager.state
-
-    def get_item_by_name(self, name: str) -> ScheduledItem | None:
-        """Get a scheduled item by name."""
-        for item in self.config.post_trigger:
-            if item.name == name:
-                return item
-        return None
-
-    def get_schedule(self, item_name: str) -> ParsedSchedule | None:
-        """Get parsed schedule for an item."""
-        return self._parsed_schedules.get(item_name)
-
-    def get_next_scheduled(
-        self,
-        now: datetime | None = None,
-    ) -> list[tuple[ScheduledItem, datetime, str]]:
-        """Get list of items with their next scheduled time.
-
-        Returns list of (item, next_time, period_key) tuples, sorted by time.
-        """
-        now = now or datetime.now(timezone.utc)
-
-        if self.state.status != Status.TRIGGERED or not self.state.trigger_time:
-            return []
-
-        result = []
-        for item in self.config.post_trigger:
-            schedule = self._parsed_schedules.get(item.name)
-            if not schedule:
-                continue
-
-            next_occ = get_next_occurrence(schedule, self.state.trigger_time, now)
-            if next_occ:
-                result.append((item, next_occ.time, next_occ.period_key))
-
-        # Sort by time
-        result.sort(key=lambda x: x[1])
-        return result
 
     async def execute_item(self, item: ScheduledItem, period_key: str) -> ScheduledExecution:
         """Execute a scheduled item.
@@ -227,8 +189,6 @@ class Scheduler:
 
     async def _run_loop(self) -> None:
         """Main scheduler loop."""
-        logger.info("Scheduler started")
-
         try:
             while self._running:
                 if self.state.status == Status.TRIGGERED:
@@ -266,15 +226,6 @@ class Scheduler:
         """Check if scheduler is running."""
         return self._running and self._task is not None and not self._task.done()
 
-    def mark_complete_from_peer(self, item_name: str, period_key: str) -> None:
-        """Mark a scheduled item as complete (received from peer).
-
-        This prevents this node from running the same item.
-        """
-        self.state_manager.state.mark_schedule_item_run(item_name, period_key)
-        self.state_manager.save()
-        logger.info(f"Marked '{item_name}' as complete for period {period_key} (from peer)")
-
     def get_schedule_status(self) -> list[dict[str, Any]]:
         """Get status of all scheduled items.
 
@@ -290,7 +241,7 @@ class Scheduler:
             info: dict[str, Any] = {
                 "name": item.name,
                 "when": item.when,
-                "last_run": item_state.last_run.isoformat() if item_state and item_state.last_run else None,
+                "last_run": format_datetime(item_state.last_run) if item_state else None,
                 "last_period": item_state.period if item_state else None,
             }
 

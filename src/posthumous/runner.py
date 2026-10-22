@@ -71,7 +71,7 @@ class DaemonRunner:
 
         Idempotent. Never raises: peer-side errors are logged and skipped.
         """
-        state_path = self.config.config_dir / "state.yaml"
+        state_path = State.get_default_state_path(self.config.config_dir)
         encryption_secret = self.config.get_encryption_secret()
 
         if not state_path.exists():
@@ -90,7 +90,7 @@ class DaemonRunner:
                 logger.warning("State corrupt and no peers configured; starting fresh")
             return
 
-        temp_manager = StateManager(state_path, encryption_secret)
+        temp_manager = StateManager.for_config(self.config)
         temp_peer = PeerManager(self.config, temp_manager)
         try:
             if state_is_corrupt:
@@ -114,10 +114,7 @@ class DaemonRunner:
         config = self.config
 
         # Foundation: state + notifications + scripts + auth
-        self.state_manager = StateManager(
-            config.config_dir / "state.yaml",
-            config.get_encryption_secret(),
-        )
+        self.state_manager = StateManager.for_config(config)
         self.notification_manager = NotificationManager(config.notifications)
         self.script_runner = ScriptRunner(config.config_dir)
         self.authenticator = Authenticator(

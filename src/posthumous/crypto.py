@@ -8,6 +8,8 @@ import logging
 import os
 from pathlib import Path
 
+from posthumous.fileio import atomic_write
+
 logger = logging.getLogger(__name__)
 
 # Magic bytes to identify encrypted files
@@ -125,40 +127,6 @@ def is_encrypted(data: bytes) -> bool:
     return data.startswith(ENCRYPTED_MAGIC_V1) or data.startswith(ENCRYPTED_MAGIC_V2)
 
 
-def encrypt_file(path: Path, secret: str) -> None:
-    """Encrypt a file in place using v2 format.
-
-    If the file is already encrypted (v1 or v2), this is a no-op.
-    Uses atomic write (temp + rename) for safety.
-    """
-    import tempfile
-
-    data = path.read_bytes()
-    if is_encrypted(data):
-        return  # Already encrypted
-
-    key, salt = derive_key(secret)
-    encrypted = encrypt(data.decode(), key, salt)
-
-    fd, temp_path = tempfile.mkstemp(
-        dir=path.parent,
-        prefix='.enc_',
-        suffix='.tmp',
-    )
-    try:
-        os.write(fd, encrypted)
-        os.close(fd)
-        os.replace(temp_path, path)
-        os.chmod(path, 0o600)
-        logger.info(f"Encrypted {path}")
-    except Exception:
-        try:
-            os.unlink(temp_path)
-        except OSError:
-            pass
-        raise
-
-
 def decrypt_file(path: Path, secret: str) -> str:
     """Read and decrypt a file.
 
@@ -170,27 +138,8 @@ def decrypt_file(path: Path, secret: str) -> str:
     if data.startswith(ENCRYPTED_MAGIC_V1):
         # V1 file: decrypt, then re-encrypt as v2 (auto-migration)
         plaintext = decrypt(data, secret=secret)
-        # Re-encrypt as v2
-        key, salt = derive_key(secret)
-        v2_data = encrypt(plaintext, key, salt)
-        # Atomic write back
-        import tempfile
-        fd, temp_path = tempfile.mkstemp(
-            dir=path.parent,
-            prefix='.enc_',
-            suffix='.tmp',
-        )
-        try:
-            os.write(fd, v2_data)
-            os.close(fd)
-            os.replace(temp_path, path)
-            logger.info(f"Migrated {path} from v1 to v2 encryption format")
-        except Exception:
-            try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
-            raise
+        save_encrypted(path, plaintext, secret)
+        logger.info(f"Migrated {path} from v1 to v2 encryption format")
         return plaintext
 
     if data.startswith(ENCRYPTED_MAGIC_V2):
@@ -205,25 +154,5 @@ def save_encrypted(path: Path, content: str, secret: str) -> None:
 
     Uses atomic write (temp + rename) for safety.
     """
-    import tempfile
-
     key, salt = derive_key(secret)
-    encrypted = encrypt(content, key, salt)
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_path = tempfile.mkstemp(
-        dir=path.parent,
-        prefix='.enc_',
-        suffix='.tmp',
-    )
-    try:
-        os.write(fd, encrypted)
-        os.close(fd)
-        os.replace(temp_path, path)
-        os.chmod(path, 0o600)
-    except Exception:
-        try:
-            os.unlink(temp_path)
-        except OSError:
-            pass
-        raise
+    atomic_write(path, encrypt(content, key, salt), prefix='.enc_')

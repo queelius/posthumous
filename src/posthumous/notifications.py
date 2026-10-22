@@ -161,20 +161,6 @@ class NotificationManager:
             error=last_error,
         )
 
-    async def send_to_multiple(
-        self,
-        channels: list[str],
-        message: str,
-        title: str = "Posthumous",
-        context: dict[str, Any] | None = None,
-    ) -> list[NotificationResult]:
-        """Send notification to multiple channels concurrently."""
-        tasks = [
-            self.send(channel, message, title, context)
-            for channel in channels
-        ]
-        return await asyncio.gather(*tasks)
-
     async def test_channel(self, channel: str) -> NotificationResult:
         """Send a test notification to verify channel configuration."""
         return await self.send(
@@ -190,14 +176,6 @@ class NotificationManager:
         for channel in self.channels:
             results[channel] = await self.test_channel(channel)
         return results
-
-    def get_channel_urls(self, channel: str) -> list[str]:
-        """Get the URLs configured for a channel (for display)."""
-        return self.channels.get(channel, [])
-
-    def list_channels(self) -> list[str]:
-        """List all configured channel names."""
-        return list(self.channels.keys())
 
 
 def build_context(
@@ -282,49 +260,3 @@ def build_context(
 
     return context
 
-
-# Convenience functions for common notification patterns
-
-async def send_warning_notification(
-    manager: NotificationManager,
-    channel: str,
-    message: str,
-    context: dict[str, Any],
-) -> NotificationResult:
-    """Send a warning notification."""
-    return await manager.send(
-        channel=channel,
-        message=message,
-        title="Posthumous Warning",
-        context=context,
-    )
-
-
-async def send_grace_notification(
-    manager: NotificationManager,
-    channel: str,
-    message: str,
-    context: dict[str, Any],
-) -> NotificationResult:
-    """Send a grace period notification."""
-    return await manager.send(
-        channel=channel,
-        message=message,
-        title="Posthumous - URGENT",
-        context=context,
-    )
-
-
-async def send_trigger_notification(
-    manager: NotificationManager,
-    channel: str,
-    message: str,
-    context: dict[str, Any],
-) -> NotificationResult:
-    """Send a trigger notification."""
-    return await manager.send(
-        channel=channel,
-        message=message,
-        title="Posthumous Activated",
-        context=context,
-    )

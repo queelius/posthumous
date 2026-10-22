@@ -6,12 +6,13 @@ import asyncio
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 import aiohttp
 
-from posthumous.auth import sign_message
+from posthumous.auth import sign_message, sync_message
+from posthumous.state import Status, parse_datetime
 
 if TYPE_CHECKING:
     from posthumous.config import Config
@@ -120,6 +121,15 @@ class PeerManager:
             logger.exception(f"Error getting from {url}: {e}")
             return None, str(e)
 
+    async def _fetch_peer_state(self, peer_url: str) -> tuple[dict | None, str | None]:
+        """GET a peer's full state from the signed /sync/state endpoint.
+
+        Returns (data, error_message).
+        """
+        ts = datetime.now(timezone.utc).isoformat()
+        sig = sign_message(self.config.secret_key, sync_message("state", ts))
+        return await self._get(peer_url, "sync/state", params={"ts": ts, "sig": sig})
+
     async def _broadcast_to_peer(
         self,
         peer_url: str,
@@ -178,7 +188,7 @@ class PeerManager:
     async def broadcast_checkin(self, timestamp: datetime) -> dict[str, bool]:
         """Broadcast check-in to all peers."""
         timestamp_str = timestamp.isoformat()
-        signature = sign_message(self.config.secret_key, f"checkin:{timestamp_str}")
+        signature = sign_message(self.config.secret_key, sync_message("checkin", timestamp_str))
 
         return await self._broadcast_to_all(
             "sync/checkin",
@@ -194,7 +204,7 @@ class PeerManager:
     async def broadcast_trigger(self, timestamp: datetime) -> dict[str, bool]:
         """Broadcast a trigger event to all peers. Outer HMAC over the timestamp."""
         timestamp_str = timestamp.isoformat()
-        signature = sign_message(self.config.secret_key, f"trigger:{timestamp_str}")
+        signature = sign_message(self.config.secret_key, sync_message("trigger", timestamp_str))
 
         return await self._broadcast_to_all(
             "sync/trigger",
@@ -219,7 +229,8 @@ class PeerManager:
         """
         timestamp_str = datetime.now(timezone.utc).isoformat()
         signature = sign_message(
-            self.config.secret_key, f"scheduled:{item_name}:{period}:{timestamp_str}"
+            self.config.secret_key,
+            sync_message("scheduled", timestamp_str, item_name, period),
         )
 
         return await self._broadcast_to_all(
@@ -251,9 +262,7 @@ class PeerManager:
         try:
             last_checkin = None
             if data and data.get("last_checkin"):
-                last_checkin = datetime.fromisoformat(
-                    data["last_checkin"].replace('Z', '+00:00')
-                )
+                last_checkin = parse_datetime(data["last_checkin"])
 
             return PeerStatus(
                 url=peer_url,
@@ -300,8 +309,6 @@ class PeerManager:
         if not self.config.peers:
             return {}
 
-        from posthumous.state import Status
-
         def parse_ts(value: object) -> datetime | None:
             """Parse a peer-supplied ISO timestamp, or None if absent/malformed.
 
@@ -312,7 +319,7 @@ class PeerManager:
             if not isinstance(value, str):
                 return None
             try:
-                return datetime.fromisoformat(value.replace('Z', '+00:00'))
+                return parse_datetime(value)
             except ValueError:
                 return None
 
@@ -321,11 +328,7 @@ class PeerManager:
         # unreachable peer, so the extra round-trip only doubled startup
         # latency and the chance of a clock-skew rejection on the real call.
         async def fetch(peer_url: str) -> dict | None:
-            ts = datetime.now(timezone.utc).isoformat()
-            sig = sign_message(self.config.secret_key, f"state:{ts}")
-            data, error = await self._get(
-                peer_url, "sync/state", params={"ts": ts, "sig": sig}
-            )
+            data, error = await self._fetch_peer_state(peer_url)
             if error:
                 # Surface the skipped peer. A silent drop here (e.g. a
                 # clock-skew 401 from /sync/state) would mean a returning
@@ -407,33 +410,23 @@ class PeerManager:
             return False
 
         # Get full state from best peer (signed request)
-        ts = datetime.now(timezone.utc).isoformat()
-        sig = sign_message(self.config.secret_key, f"state:{ts}")
-        data, error = await self._get(
-            best_peer.url, "sync/state", params={"ts": ts, "sig": sig}
-        )
+        data, error = await self._fetch_peer_state(best_peer.url)
         if error:
             logger.error(f"Failed to get state from {best_peer.url}: {error}")
             return False
 
         # Apply state
-        from posthumous.state import State, Status
-
         try:
             state = self.state_manager.state
 
             if data.get("last_checkin"):
-                state.last_checkin = datetime.fromisoformat(
-                    data["last_checkin"].replace('Z', '+00:00')
-                )
+                state.last_checkin = parse_datetime(data["last_checkin"])
 
             if data.get("status"):
                 state.status = Status(data["status"])
 
             if data.get("trigger_time"):
-                state.trigger_time = datetime.fromisoformat(
-                    data["trigger_time"].replace('Z', '+00:00')
-                )
+                state.trigger_time = parse_datetime(data["trigger_time"])
 
             # Sync schedule state
             for name, item_data in data.get("schedule_state", {}).items():

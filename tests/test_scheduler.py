@@ -83,33 +83,6 @@ class TestSchedulerInit:
         assert "invalid" not in scheduler._parsed_schedules
 
 
-class TestGetNextScheduled:
-    """Tests for next scheduled time calculation."""
-
-    def test_returns_empty_when_not_triggered(self, config, state_manager):
-        scheduler = Scheduler(config, state_manager)
-        state_manager.state.status = Status.ARMED
-
-        result = scheduler.get_next_scheduled()
-
-        assert result == []
-
-    def test_returns_sorted_items(self, config, state_manager, notification_manager):
-        scheduler = Scheduler(config, state_manager, notification_manager)
-
-        trigger_time = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
-        state_manager.state.status = Status.TRIGGERED
-        state_manager.state.trigger_time = trigger_time
-
-        now = datetime(2026, 1, 15, 12, 0, 1, tzinfo=timezone.utc)
-        result = scheduler.get_next_scheduled(now)
-
-        assert len(result) > 0
-        # Should be sorted by time
-        times = [item[1] for item in result]
-        assert times == sorted(times)
-
-
 class TestExecuteItem:
     """Tests for scheduled item execution."""
 
@@ -214,14 +187,6 @@ class TestCheckAndExecute:
 class TestMarkCompleteFromPeer:
     """Tests for peer-broadcasted completion marking."""
 
-    def test_marks_item_complete(self, config, state_manager):
-        scheduler = Scheduler(config, state_manager)
-
-        scheduler.mark_complete_from_peer("annual", "2026")
-
-        assert "annual" in state_manager.state.schedule_state
-        assert state_manager.state.schedule_state["annual"].period == "2026"
-
     @pytest.mark.asyncio
     async def test_prevents_local_execution(self, config, state_manager, notification_manager):
         scheduler = Scheduler(config, state_manager, notification_manager)
@@ -230,8 +195,8 @@ class TestMarkCompleteFromPeer:
         state_manager.state.status = Status.TRIGGERED
         state_manager.state.trigger_time = trigger_time
 
-        # Mark as complete from peer
-        scheduler.mark_complete_from_peer("immediate", "once")
+        # Mark as complete (as /sync/scheduled does on a peer broadcast)
+        state_manager.state.mark_schedule_item_run("immediate", "once")
 
         # Now check - should not execute
         executions = await scheduler.check_and_execute()
@@ -505,29 +470,6 @@ class TestCheckAndExecuteExtended:
         assert len(invalid_execs) == 0
 
 
-class TestSchedulerHelpers:
-    """Tests for get_item_by_name and get_schedule."""
-
-    def test_get_item_by_name_found(self, config, state_manager):
-        scheduler = Scheduler(config, state_manager)
-        item = scheduler.get_item_by_name("immediate")
-        assert item is not None
-        assert item.name == "immediate"
-
-    def test_get_item_by_name_not_found(self, config, state_manager):
-        scheduler = Scheduler(config, state_manager)
-        assert scheduler.get_item_by_name("nonexistent") is None
-
-    def test_get_schedule_found(self, config, state_manager):
-        scheduler = Scheduler(config, state_manager)
-        schedule = scheduler.get_schedule("immediate")
-        assert schedule is not None
-
-    def test_get_schedule_not_found(self, config, state_manager):
-        scheduler = Scheduler(config, state_manager)
-        assert scheduler.get_schedule("nonexistent") is None
-
-
 class TestSchedulerLifecycle:
     """Tests for scheduler start/stop."""
 
@@ -622,25 +564,6 @@ class TestScheduleStatusExtended:
 
         broken_status = next(s for s in status if s["name"] == "broken")
         assert broken_status["error"] == "Invalid when-expression"
-
-    def test_get_next_scheduled_unparsed_schedule_skipped(self, config, state_manager):
-        """Items with unparseable when-expressions are skipped in get_next_scheduled."""
-        config.post_trigger.append(ScheduledItem(
-            name="broken",
-            when="complete nonsense that cannot be parsed",
-        ))
-
-        scheduler = Scheduler(config, state_manager)
-
-        state_manager.state.status = Status.TRIGGERED
-        state_manager.state.trigger_time = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
-
-        now = datetime(2026, 1, 16, 12, 0, 0, tzinfo=timezone.utc)
-        scheduled = scheduler.get_next_scheduled(now)
-
-        # "broken" should not appear in scheduled items
-        names = [item[0].name for item in scheduled]
-        assert "broken" not in names
 
     def test_status_with_next_occurrence(self, config, state_manager):
         """get_schedule_status when triggered should compute next_run."""

@@ -8,9 +8,6 @@ from posthumous.notifications import (
     NotificationManager,
     NotificationResult,
     build_context,
-    send_warning_notification,
-    send_grace_notification,
-    send_trigger_notification,
 )
 
 
@@ -26,23 +23,6 @@ class TestNotificationManager:
 
         assert "default" in manager._apprise_instances
         assert "urgent" in manager._apprise_instances
-
-    def test_list_channels(self):
-        channels = {"default": ["ntfy://test"], "urgent": ["ntfy://urgent"]}
-        manager = NotificationManager(channels)
-
-        assert set(manager.list_channels()) == {"default", "urgent"}
-
-    def test_get_channel_urls(self):
-        channels = {"default": ["ntfy://test1", "ntfy://test2"]}
-        manager = NotificationManager(channels)
-
-        urls = manager.get_channel_urls("default")
-        assert urls == ["ntfy://test1", "ntfy://test2"]
-
-    def test_get_unknown_channel_urls(self):
-        manager = NotificationManager({})
-        assert manager.get_channel_urls("unknown") == []
 
 
 class TestMessageFormatting:
@@ -384,27 +364,6 @@ class TestNotificationSending:
                "test" in call_args.kwargs.get("title", "").lower()
 
     @pytest.mark.asyncio
-    async def test_send_to_multiple_channels(self):
-        manager = NotificationManager({
-            "channel1": ["ntfy://test1"],
-            "channel2": ["ntfy://test2"],
-        })
-
-        for name in ["channel1", "channel2"]:
-            mock_apprise = MagicMock()
-            mock_apprise.notify.return_value = True
-            mock_apprise.__len__ = lambda self: 1
-            manager._apprise_instances[name] = mock_apprise
-
-        results = await manager.send_to_multiple(
-            channels=["channel1", "channel2"],
-            message="Test message",
-        )
-
-        assert len(results) == 2
-        assert all(r.success for r in results)
-
-    @pytest.mark.asyncio
     async def test_send_exception_retries(self):
         """Exception during Apprise notify should retry."""
         manager = NotificationManager(
@@ -469,57 +428,3 @@ class TestNotificationSending:
         results = await manager.test_all_channels()
         assert results == {}
 
-
-class TestConvenienceFunctions:
-    """Tests for send_warning_notification, send_grace_notification, send_trigger_notification."""
-
-    @pytest.mark.asyncio
-    async def test_send_warning_notification(self):
-        manager = NotificationManager({"default": ["ntfy://test"]})
-        mock_apprise = MagicMock()
-        mock_apprise.notify.return_value = True
-        mock_apprise.__len__ = lambda self: 1
-        manager._apprise_instances["default"] = mock_apprise
-
-        context = {"node_name": "test", "status": "warning"}
-        result = await send_warning_notification(
-            manager, "default", "Warning test", context,
-        )
-
-        assert result.success is True
-        call_kwargs = mock_apprise.notify.call_args.kwargs
-        assert call_kwargs["title"] == "Posthumous Warning"
-
-    @pytest.mark.asyncio
-    async def test_send_grace_notification(self):
-        manager = NotificationManager({"default": ["ntfy://test"]})
-        mock_apprise = MagicMock()
-        mock_apprise.notify.return_value = True
-        mock_apprise.__len__ = lambda self: 1
-        manager._apprise_instances["default"] = mock_apprise
-
-        context = {"node_name": "test", "status": "grace"}
-        result = await send_grace_notification(
-            manager, "default", "Grace test", context,
-        )
-
-        assert result.success is True
-        call_kwargs = mock_apprise.notify.call_args.kwargs
-        assert call_kwargs["title"] == "Posthumous - URGENT"
-
-    @pytest.mark.asyncio
-    async def test_send_trigger_notification(self):
-        manager = NotificationManager({"default": ["ntfy://test"]})
-        mock_apprise = MagicMock()
-        mock_apprise.notify.return_value = True
-        mock_apprise.__len__ = lambda self: 1
-        manager._apprise_instances["default"] = mock_apprise
-
-        context = {"node_name": "test", "status": "triggered"}
-        result = await send_trigger_notification(
-            manager, "default", "Trigger test", context,
-        )
-
-        assert result.success is True
-        call_kwargs = mock_apprise.notify.call_args.kwargs
-        assert call_kwargs["title"] == "Posthumous Activated"

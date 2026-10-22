@@ -14,10 +14,6 @@ logger = logging.getLogger(__name__)
 # sd_notify protocol
 # ---------------------------------------------------------------------------
 
-def is_systemd_managed() -> bool:
-    """Check if running under systemd (NOTIFY_SOCKET is set)."""
-    return "NOTIFY_SOCKET" in os.environ
-
 
 def _sd_notify(message: str) -> None:
     """Send a notification to systemd via NOTIFY_SOCKET. No-op if not set."""

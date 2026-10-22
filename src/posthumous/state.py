@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
-import os
-import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
+
+from posthumous.fileio import atomic_write
+
+if TYPE_CHECKING:
+    from posthumous.config import Config
 
 
 def parse_datetime(value: str | datetime | None) -> datetime | None:
@@ -32,11 +35,25 @@ def format_datetime(dt: datetime | None) -> str | None:
 
 
 class Status(Enum):
-    """Current status of the deadman switch."""
+    """Current status of the deadman switch.
+
+    Members are declared in escalation order; the watchdog derives its
+    catch-up path from this order.
+    """
     ARMED = "armed"
     WARNING = "warning"
     GRACE = "grace"
     TRIGGERED = "triggered"
+
+
+# Allowed status transitions. A check-in resets WARNING/GRACE to ARMED;
+# TRIGGERED is terminal.
+VALID_TRANSITIONS: dict[Status, frozenset[Status]] = {
+    Status.ARMED: frozenset({Status.WARNING}),
+    Status.WARNING: frozenset({Status.ARMED, Status.GRACE}),
+    Status.GRACE: frozenset({Status.ARMED, Status.TRIGGERED}),
+    Status.TRIGGERED: frozenset(),
+}
 
 
 @dataclass
@@ -242,31 +259,16 @@ class State:
             from posthumous.crypto import save_encrypted
             save_encrypted(path, content, encryption_secret)
         else:
-            # Write to temp file in same directory (for atomic rename)
-            fd, temp_path = tempfile.mkstemp(
-                dir=path.parent,
-                prefix='.state_',
-                suffix='.yaml.tmp'
-            )
-            try:
-                with os.fdopen(fd, 'w') as f:
-                    f.write(content)
-                # Atomic rename
-                os.replace(temp_path, path)
-                os.chmod(path, 0o600)
-            except Exception:
-                # Clean up temp file on error
-                try:
-                    os.unlink(temp_path)
-                except OSError:
-                    pass
-                raise
+            atomic_write(path, content.encode(), prefix='.state_', suffix='.yaml.tmp')
 
     def record_checkin(self, timestamp: datetime | None = None) -> None:
         """Record a successful check-in."""
         self.last_checkin = timestamp or datetime.now(timezone.utc)
         self.status = Status.ARMED
-        # Clear failed attempts and any lockouts on successful checkin
+        self.clear_auth_failures()
+
+    def clear_auth_failures(self) -> None:
+        """Forget all failed attempts and lockouts (after a successful auth)."""
         self.failed_attempts = []
         self.lockouts = {}
 
@@ -280,23 +282,7 @@ class State:
 
         Returns True if transition occurred, False if no change needed.
         """
-        if self.status == new_status:
-            return False
-
-        # Valid transitions
-        valid_transitions = {
-            Status.ARMED: {Status.WARNING},
-            Status.WARNING: {Status.ARMED, Status.GRACE},
-            Status.GRACE: {Status.ARMED, Status.TRIGGERED},
-            Status.TRIGGERED: set(),  # No transitions out of TRIGGERED
-        }
-
-        # Check-in can always reset to ARMED (except from TRIGGERED)
-        if new_status == Status.ARMED and self.status != Status.TRIGGERED:
-            self.status = Status.ARMED
-            return True
-
-        if new_status in valid_transitions.get(self.status, set()):
+        if new_status in VALID_TRANSITIONS[self.status]:
             self.status = new_status
             if new_status == Status.TRIGGERED:
                 self.trigger_time = trigger_time or datetime.now(timezone.utc)
@@ -355,13 +341,6 @@ class State:
             period=period,
         )
 
-    def should_run_schedule_item(self, name: str, period: str) -> bool:
-        """Check if a scheduled item should run for the given period."""
-        if name not in self.schedule_state:
-            return True
-        item = self.schedule_state[name]
-        return item.period != period
-
     def update_peer(
         self,
         url: str,
@@ -394,6 +373,11 @@ class StateManager:
         self.path = Path(path)
         self.encryption_secret = encryption_secret
         self._state: State | None = None
+
+    @classmethod
+    def for_config(cls, config: Config) -> StateManager:
+        """Create the manager for a node's state file, encrypted per its config."""
+        return cls(State.get_default_state_path(config.config_dir), config.get_encryption_secret())
 
     @property
     def state(self) -> State:

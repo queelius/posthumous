@@ -10,8 +10,14 @@ from typing import TYPE_CHECKING
 
 from aiohttp import web
 
-from posthumous.auth import Authenticator, AuthError, LockedOutError
-from posthumous.state import Status
+from posthumous.auth import (
+    Authenticator,
+    AuthError,
+    LockedOutError,
+    sync_message,
+    verify_signature,
+)
+from posthumous.state import Status, format_datetime, parse_datetime
 
 
 def _format_duration(td: timedelta) -> str:
@@ -313,34 +319,38 @@ class Server:
 
         return f"Last check-in: {since} ago"
 
-    def _check_timestamp_freshness(self, timestamp_str: str) -> str | None:
-        """Return an error string if the timestamp is malformed or outside the freshness window."""
-        try:
-            msg_time = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-        except (ValueError, AttributeError):
-            return "Malformed timestamp"
-        if abs((datetime.now(timezone.utc) - msg_time).total_seconds()) > self.SYNC_FRESHNESS_SECONDS:
-            return "Stale timestamp"
-        return None
-
     def _verify_sync_message(
-        self, timestamp_str: str, signature: str, message_prefix: str
-    ) -> str | None:
+        self, timestamp_str: str, signature: str, kind: str, *fields: str
+    ) -> tuple[datetime | None, str | None]:
         """Verify freshness and HMAC signature of a sync message.
 
-        Returns None if valid, or an error string if invalid.
+        Returns (message_time, None) if valid, or (None, error) if invalid, so
+        handlers use the already-parsed timestamp instead of parsing it again.
         """
-        error = self._check_timestamp_freshness(timestamp_str)
-        if error:
-            return error
-
-        from posthumous.auth import verify_signature
+        try:
+            msg_time = parse_datetime(timestamp_str)
+        except (ValueError, AttributeError):
+            return None, "Malformed timestamp"
+        if abs((datetime.now(timezone.utc) - msg_time).total_seconds()) > self.SYNC_FRESHNESS_SECONDS:
+            return None, "Stale timestamp"
         if not verify_signature(
-            self.config.secret_key, f"{message_prefix}:{timestamp_str}", signature
+            self.config.secret_key, sync_message(kind, timestamp_str, *fields), signature
         ):
-            return "Invalid signature"
+            return None, "Invalid signature"
+        return msg_time, None
 
-        return None
+    def _render_checkin_page(self, message: str, form_html: str) -> web.Response:
+        """Render the check-in page for the current status."""
+        status = self.state_manager.state.status.value
+        html = CHECKIN_HTML.format(
+            status=status.upper(),
+            status_class=status,
+            time_info=self._get_time_info(),
+            node_name=self.config.node_name,
+            message=message,
+            form_html=form_html,
+        )
+        return web.Response(text=html, content_type='text/html')
 
     async def handle_index(self, request: web.Request) -> web.Response:
         """Redirect to check-in form."""
@@ -349,16 +359,10 @@ class Server:
     async def handle_checkin_form(self, request: web.Request) -> web.Response:
         """Render check-in form."""
         csrf_token = self._generate_csrf_token()
-        status = self.state_manager.state.status.value
-        html = CHECKIN_HTML.format(
-            status=status.upper(),
-            status_class=status,
-            time_info=self._get_time_info(),
-            node_name=self.config.node_name,
-            message="",
-            form_html=self._get_form_html(csrf_token, source=request.remote),
+        response = self._render_checkin_page(
+            "",
+            self._get_form_html(csrf_token, source=request.remote),
         )
-        response = web.Response(text=html, content_type='text/html')
         response.set_cookie('csrf_token', csrf_token, httponly=True, samesite='Strict')
         return response
 
@@ -494,36 +498,25 @@ class Server:
                 source=client_ip,
             )
         except LockedOutError as e:
-            self.state_manager.save()
             if content_type == 'application/json':
                 return web.json_response(
                     {'success': False, 'error': str(e)},
                     status=429,
                 )
-            html = CHECKIN_HTML.format(
-                status=self.state_manager.state.status.value.upper(),
-                status_class=self.state_manager.state.status.value,
-                time_info=self._get_time_info(),
-                node_name=self.config.node_name,
-                message=f'<div class="message error">{e}</div>',
-                form_html=self._LOCKOUT_HTML,
+            return self._render_checkin_page(
+                f'<div class="message error">{e}</div>',
+                self._LOCKOUT_HTML,
             )
-            return web.Response(text=html, content_type='text/html')
         except AuthError as e:
             if content_type == 'application/json':
                 return web.json_response(
                     {'success': False, 'error': str(e)},
                     status=400,
                 )
-            html = CHECKIN_HTML.format(
-                status=self.state_manager.state.status.value.upper(),
-                status_class=self.state_manager.state.status.value,
-                time_info=self._get_time_info(),
-                node_name=self.config.node_name,
-                message=f'<div class="message error">{e}</div>',
-                form_html=self._get_form_html(source=client_ip),
+            return self._render_checkin_page(
+                f'<div class="message error">{e}</div>',
+                self._get_form_html(source=client_ip),
             )
-            return web.Response(text=html, content_type='text/html')
 
         if not success:
             self.state_manager.save()
@@ -533,15 +526,10 @@ class Server:
                     {'success': False, 'error': 'Invalid code'},
                     status=401,
                 )
-            html = CHECKIN_HTML.format(
-                status=self.state_manager.state.status.value.upper(),
-                status_class=self.state_manager.state.status.value,
-                time_info=self._get_time_info(),
-                node_name=self.config.node_name,
-                message='<div class="message error">Invalid code. Please try again.</div>',
-                form_html=self._get_form_html(source=client_ip),
+            return self._render_checkin_page(
+                '<div class="message error">Invalid code. Please try again.</div>',
+                self._get_form_html(source=client_ip),
             )
-            return web.Response(text=html, content_type='text/html')
 
         # Process check-in
         checkin_time = datetime.now(timezone.utc)
@@ -552,15 +540,10 @@ class Server:
                     {'success': False, 'error': 'Node is triggered'},
                     status=409,
                 )
-            html = CHECKIN_HTML.format(
-                status=self.state_manager.state.status.value.upper(),
-                status_class=self.state_manager.state.status.value,
-                time_info=self._get_time_info(),
-                node_name=self.config.node_name,
-                message='<div class="message error">Node is already triggered. Check-in rejected.</div>',
-                form_html=self._TRIGGERED_HTML,
+            return self._render_checkin_page(
+                '<div class="message error">Node is already triggered. Check-in rejected.</div>',
+                self._TRIGGERED_HTML,
             )
-            return web.Response(text=html, content_type='text/html')
 
         # Broadcast to peers
         if self.peer_manager:
@@ -569,22 +552,16 @@ class Server:
         logger.info(f"Check-in accepted from {client_ip}")
 
         if content_type == 'application/json':
-            tr = self.watchdog.get_time_remaining()
             return web.json_response({
                 'success': True,
                 'status': self.state_manager.state.status.value,
                 'next_deadline': (checkin_time + self.config.trigger_at).isoformat(),
             })
 
-        html = CHECKIN_HTML.format(
-            status=self.state_manager.state.status.value.upper(),
-            status_class=self.state_manager.state.status.value,
-            time_info=self._get_time_info(),
-            node_name=self.config.node_name,
-            message='<div class="message success">Check-in successful!</div>',
-            form_html=self._get_form_html(),
+        return self._render_checkin_page(
+            '<div class="message success">Check-in successful!</div>',
+            self._get_form_html(),
         )
-        return web.Response(text=html, content_type='text/html')
 
     async def handle_status(self, request: web.Request) -> web.Response:
         """Return current status as JSON."""
@@ -594,8 +571,8 @@ class Server:
         return web.json_response({
             'node_name': self.config.node_name,
             'status': state.status.value,
-            'last_checkin': state.last_checkin.isoformat() if state.last_checkin else None,
-            'trigger_time': state.trigger_time.isoformat() if state.trigger_time else None,
+            'last_checkin': format_datetime(state.last_checkin),
+            'trigger_time': format_datetime(state.trigger_time),
             'time_remaining': {
                 'until_warning': tr.until_warning.total_seconds() if tr.until_warning else None,
                 'until_grace': tr.until_grace.total_seconds() if tr.until_grace else None,
@@ -631,16 +608,11 @@ class Server:
         if not timestamp or not signature:
             return web.json_response({'error': 'Missing fields'}, status=400)
 
-        error = self._verify_sync_message(timestamp, signature, "checkin")
+        checkin_time, error = self._verify_sync_message(timestamp, signature, "checkin")
         if error:
             logger.warning(f"Sync checkin rejected: {error}")
             return web.json_response({'error': error}, status=401)
 
-        # Process check-in (defense in depth; _verify_sync_message already parsed it)
-        try:
-            checkin_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-        except (ValueError, AttributeError):
-            return web.json_response({'error': 'Malformed timestamp'}, status=400)
         self.watchdog.checkin(checkin_time)
         logger.info(f"Processed sync checkin from peer")
 
@@ -659,17 +631,12 @@ class Server:
         if not timestamp or not signature:
             return web.json_response({'error': 'Missing fields'}, status=400)
 
-        error = self._verify_sync_message(timestamp, signature, "trigger")
+        peer_time, error = self._verify_sync_message(timestamp, signature, "trigger")
         if error:
             logger.warning(f"Sync trigger rejected: {error}")
             return web.json_response({'error': error}, status=401)
 
-        # Mark as triggered with the peer's timestamp (defense in depth)
-        from posthumous.state import Status
-        try:
-            peer_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-        except (ValueError, AttributeError):
-            return web.json_response({'error': 'Malformed timestamp'}, status=400)
+        # Mark as triggered with the peer's timestamp
         self.state_manager.transition(Status.TRIGGERED, trigger_time=peer_time)
         logger.info("Received trigger broadcast from peer")
 
@@ -693,8 +660,8 @@ class Server:
         if not item_name or not period or not timestamp or not signature:
             return web.json_response({'error': 'Missing fields'}, status=400)
 
-        error = self._verify_sync_message(
-            timestamp, signature, f"scheduled:{item_name}:{period}"
+        _, error = self._verify_sync_message(
+            timestamp, signature, "scheduled", item_name, period
         )
         if error:
             logger.warning(f"Sync scheduled rejected: {error}")
@@ -715,25 +682,17 @@ class Server:
         if not ts or not sig:
             return web.json_response({'error': 'Authentication required'}, status=401)
 
-        error = self._verify_sync_message(ts, sig, "state")
+        _, error = self._verify_sync_message(ts, sig, "state")
         if error:
             logger.warning(f"Sync state request rejected: {error}")
             return web.json_response({'error': error}, status=401)
 
-        state = self.state_manager.state
-
+        # Reuse State's own serialization, exposing only what peers need to
+        # merge; failed attempts, lockouts and peer health stay private.
+        state = self.state_manager.state.to_dict()
         return web.json_response({
             'node_name': self.config.node_name,
-            'status': state.status.value,
-            'last_checkin': state.last_checkin.isoformat() if state.last_checkin else None,
-            'trigger_time': state.trigger_time.isoformat() if state.trigger_time else None,
-            'schedule_state': {
-                name: {
-                    'last_run': item.last_run.isoformat() if item.last_run else None,
-                    'period': item.period,
-                }
-                for name, item in state.schedule_state.items()
-            },
+            **{key: state[key] for key in ('status', 'last_checkin', 'trigger_time', 'schedule_state')},
         })
 
     async def start(self) -> None:

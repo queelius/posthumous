@@ -10,24 +10,11 @@ from posthumous.systemd import (
     generate_unit_file,
     get_unit_path,
     is_service_installed,
-    is_systemd_managed,
     notify_ready,
     notify_stopping,
     notify_watchdog,
     UNIT_TEMPLATE,
 )
-
-
-class TestIsSystemdManaged:
-    """Tests for is_systemd_managed()."""
-
-    def test_true_when_notify_socket_set(self, monkeypatch):
-        monkeypatch.setenv("NOTIFY_SOCKET", "/run/systemd/notify")
-        assert is_systemd_managed() is True
-
-    def test_false_when_notify_socket_absent(self, monkeypatch):
-        monkeypatch.delenv("NOTIFY_SOCKET", raising=False)
-        assert is_systemd_managed() is False
 
 
 class TestSdNotify:

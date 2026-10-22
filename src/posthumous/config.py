@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-import os
 import secrets
-import tempfile
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+from posthumous.fileio import atomic_write
 
 
 def parse_duration(value: str | int | float) -> timedelta:
@@ -75,6 +75,12 @@ class ScheduledItem:
     script: str | None = None
     notify: str | None = None
     message: str | None = None
+
+
+# Config fields that hold a per-event action list. Each name doubles as its
+# YAML key under `actions:`, so parsing, serializing and validation all loop
+# over this one tuple.
+ACTION_EVENTS = ("on_warning", "on_grace", "on_trigger", "on_peer_down")
 
 
 @dataclass
@@ -218,10 +224,7 @@ class Config:
             trigger_at=get_duration('trigger_at', timedelta(days=14)),
             peers=data.get('peers', []),
             notifications=notifications,
-            on_warning=parse_actions(actions_config.get('on_warning')),
-            on_grace=parse_actions(actions_config.get('on_grace')),
-            on_trigger=parse_actions(actions_config.get('on_trigger')),
-            on_peer_down=parse_actions(actions_config.get('on_peer_down')),
+            **{event: parse_actions(actions_config.get(event)) for event in ACTION_EVENTS},
             post_trigger=parse_scheduled(data.get('post_trigger')),
             api_token=data.get('api_token'),
             max_failed_attempts=data.get('max_failed_attempts', 5),
@@ -291,15 +294,11 @@ class Config:
         if self.notifications:
             data['notifications'] = self.notifications
 
-        actions = {}
-        if self.on_warning:
-            actions['on_warning'] = serialize_actions(self.on_warning)
-        if self.on_grace:
-            actions['on_grace'] = serialize_actions(self.on_grace)
-        if self.on_trigger:
-            actions['on_trigger'] = serialize_actions(self.on_trigger)
-        if self.on_peer_down:
-            actions['on_peer_down'] = serialize_actions(self.on_peer_down)
+        actions = {
+            event: serialize_actions(getattr(self, event))
+            for event in ACTION_EVENTS
+            if getattr(self, event)
+        }
         if actions:
             data['actions'] = actions
 
@@ -332,25 +331,8 @@ class Config:
     def save(self, path: Path | str | None = None) -> None:
         """Save configuration to a YAML file (atomic write)."""
         path = Path(path) if path else self.config_dir / "config.yaml"
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Write to temp file in same directory for atomic rename
-        fd, temp_path = tempfile.mkstemp(
-            dir=path.parent,
-            prefix='.config_',
-            suffix='.yaml.tmp',
-        )
-        try:
-            with os.fdopen(fd, 'w') as f:
-                yaml.dump(self.to_dict(), f, default_flow_style=False, sort_keys=False)
-            os.replace(temp_path, path)
-            os.chmod(path, 0o600)
-        except Exception:
-            try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
-            raise
+        content = yaml.dump(self.to_dict(), default_flow_style=False, sort_keys=False)
+        atomic_write(path, content.encode(), prefix='.config_', suffix='.yaml.tmp')
 
     def get_base_url(self) -> str:
         """Get the effective base URL for constructing check-in/dashboard links.
@@ -416,10 +398,8 @@ class Config:
                             f"Action in {event_name} references unknown channel: {action.channel}"
                         )
 
-        check_actions(self.on_warning, 'on_warning')
-        check_actions(self.on_grace, 'on_grace')
-        check_actions(self.on_trigger, 'on_trigger')
-        check_actions(self.on_peer_down, 'on_peer_down')
+        for event in ACTION_EVENTS:
+            check_actions(getattr(self, event), event)
 
         for item in self.post_trigger:
             if item.notify and item.notify not in all_channels:

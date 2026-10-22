@@ -5,9 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
-import io
 import secrets
-import time
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
@@ -49,34 +47,6 @@ def get_provisioning_uri(secret: str, node_name: str) -> str:
     """Get the provisioning URI for authenticator apps."""
     totp = get_totp(secret)
     return totp.provisioning_uri(name=node_name, issuer_name="Posthumous")
-
-
-def generate_qr_code(secret: str, node_name: str) -> bytes:
-    """Generate a QR code image for the TOTP secret.
-
-    Returns PNG image bytes.
-    """
-    try:
-        import qrcode
-    except ImportError:
-        raise ImportError("qrcode package required for QR code generation")
-
-    uri = get_provisioning_uri(secret, node_name)
-
-    qr = qrcode.QRCode(
-        version=1,
-        error_correction=qrcode.constants.ERROR_CORRECT_L,
-        box_size=10,
-        border=4,
-    )
-    qr.add_data(uri)
-    qr.make(fit=True)
-
-    img = qr.make_image(fill_color="black", back_color="white")
-
-    buffer = io.BytesIO()
-    img.save(buffer, format='PNG')
-    return buffer.getvalue()
 
 
 def generate_qr_code_terminal(secret: str, node_name: str) -> str:
@@ -215,14 +185,18 @@ class Authenticator:
             )
 
         if success and state:
-            state.failed_attempts = []
-            state.lockouts = {}
+            state.clear_auth_failures()
 
         return success
 
-    def get_current_code(self) -> str:
-        """Get the current TOTP code (for testing/debugging)."""
-        return get_totp(self.secret).now()
+
+def sync_message(kind: str, timestamp: str, *fields: str) -> str:
+    """Build the string that is HMAC-signed for a peer sync message.
+
+    Format is "<kind>:<field>...:<timestamp>". Senders (peers.py) and the
+    receiver (server.py) both build it here so the wire format is defined once.
+    """
+    return ":".join(map(str, (kind, *fields, timestamp)))
 
 
 def sign_message(secret: str, message: str) -> str:

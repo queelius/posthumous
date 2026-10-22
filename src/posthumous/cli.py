@@ -99,12 +99,14 @@ def config(ctx: click.Context) -> None:
 @click.pass_context
 def path(ctx: click.Context) -> None:
     """Show file and directory locations."""
+    from posthumous.state import State
+
     config_path = _resolve_config_path(ctx)
     config_dir = config_path.parent
 
     paths = [
         ("Config file", config_path),
-        ("State file", config_dir / "state.yaml"),
+        ("State file", State.get_default_state_path(config_dir)),
         ("Scripts dir", config_dir / "scripts"),
         ("Logs dir", config_dir / "logs"),
     ]
@@ -237,10 +239,10 @@ def logs(follow: bool) -> None:
 def init(ctx: click.Context, node_name: str, join_url: str | None) -> None:
     """Initialize a new Posthumous node."""
     from posthumous.auth import generate_secret, generate_qr_code_terminal, get_provisioning_uri
-    from posthumous.config import Config, generate_default_config
+    from posthumous.config import generate_default_config
     from posthumous.scripts import create_example_script
 
-    config_path = ctx.obj.get('config_path') or Config.get_default_config_path()
+    config_path = _resolve_config_path(ctx)
     config_dir = config_path.parent
 
     if config_path.exists():
@@ -488,9 +490,7 @@ def checkin(ctx: click.Context, token: str | None) -> None:
     # daemon_result is None: daemon unreachable, check in directly against disk.
     click.echo("Daemon not running, checking in directly.", err=True)
 
-    state_manager = StateManager(
-        config.config_dir / "state.yaml", config.get_encryption_secret()
-    )
+    state_manager = StateManager.for_config(config)
 
     if state_manager.state.status == Status.TRIGGERED:
         click.echo("Node is already TRIGGERED. Check-in not possible.", err=True)
@@ -509,7 +509,6 @@ def checkin(ctx: click.Context, token: str | None) -> None:
             state=state_manager.state, source="cli",
         )
     except LockedOutError as e:
-        state_manager.save()
         click.echo(str(e), err=True)
         sys.exit(1)
     except AuthError as e:
@@ -556,7 +555,7 @@ def status(ctx: click.Context) -> None:
     from posthumous.watchdog import Watchdog, format_time_remaining
 
     _, config = _load_config_or_exit(ctx)
-    state_manager = StateManager(config.config_dir / "state.yaml", config.get_encryption_secret())
+    state_manager = StateManager.for_config(config)
     watchdog = Watchdog(config, state_manager)
 
     state = state_manager.state
@@ -595,7 +594,7 @@ def reset(ctx: click.Context, force: bool) -> None:
     from posthumous.state import StateManager, Status
 
     _, config = _load_config_or_exit(ctx)
-    state_manager = StateManager(config.config_dir / "state.yaml", config.get_encryption_secret())
+    state_manager = StateManager.for_config(config)
     current = state_manager.state.status
 
     if current == Status.ARMED:
@@ -623,7 +622,7 @@ def recover(ctx: click.Context, force: bool) -> None:
     from posthumous.peers import PeerManager, pick_best_peer
 
     _, config = _load_config_or_exit(ctx)
-    state_manager = StateManager(config.config_dir / "state.yaml", config.get_encryption_secret())
+    state_manager = StateManager.for_config(config)
 
     async def do_recover():
         peer_manager = PeerManager(config, state_manager)
@@ -680,7 +679,7 @@ def peers(ctx: click.Context) -> None:
         click.echo("No peers configured.")
         return
 
-    state_manager = StateManager(config.config_dir / "state.yaml", config.get_encryption_secret())
+    state_manager = StateManager.for_config(config)
     peer_manager = PeerManager(config, state_manager)
 
     async def check_peers():
@@ -762,7 +761,7 @@ def export(ctx: click.Context, output: Path, decrypt: bool) -> None:
     from posthumous.state import StateManager
 
     _, config = _load_config_or_exit(ctx)
-    state_manager = StateManager(config.config_dir / "state.yaml", config.get_encryption_secret())
+    state_manager = StateManager.for_config(config)
 
     data = {
         'config': config.to_dict(),
@@ -786,9 +785,9 @@ def import_state(ctx: click.Context, input_file: Path) -> None:
     """Import state from backup."""
     import yaml
     from posthumous.config import Config
-    from posthumous.state import State, StateManager
+    from posthumous.state import State
 
-    config_path = ctx.obj.get('config_path') or Config.get_default_config_path()
+    config_path = _resolve_config_path(ctx)
 
     with open(input_file) as f:
         data = yaml.safe_load(f)
@@ -811,7 +810,7 @@ def import_state(ctx: click.Context, input_file: Path) -> None:
 
     # Restore state
     state = State.from_dict(data['state'])
-    state_path = config.config_dir / "state.yaml"
+    state_path = State.get_default_state_path(config.config_dir)
     state.save(state_path, encryption_secret=config.get_encryption_secret())
 
     click.echo(f"State restored. Status: {state.status.value}")

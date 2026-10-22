@@ -324,68 +324,6 @@ class TestScriptRunner:
         )
 
 
-class TestScriptRunnerRunMultiple:
-    """Tests for ScriptRunner.run_multiple."""
-
-    @pytest.mark.asyncio
-    async def test_sequential_execution(self, tmp_config_dir):
-        for name in ("a.py", "b.py"):
-            (tmp_config_dir / "scripts" / name).write_text(
-                f"print('{name}')\n"
-            )
-
-        runner = ScriptRunner(tmp_config_dir)
-        results = await runner.run_multiple(
-            ["scripts/a.py", "scripts/b.py"],
-            make_context(),
-            parallel=False,
-        )
-
-        assert len(results) == 2
-        assert all(r.success for r in results)
-        assert "a.py" in results[0].stdout
-        assert "b.py" in results[1].stdout
-
-    @pytest.mark.asyncio
-    async def test_parallel_execution(self, tmp_config_dir):
-        for name in ("p1.py", "p2.py"):
-            (tmp_config_dir / "scripts" / name).write_text(
-                f"print('{name}')\n"
-            )
-
-        runner = ScriptRunner(tmp_config_dir)
-        results = await runner.run_multiple(
-            ["scripts/p1.py", "scripts/p2.py"],
-            make_context(),
-            parallel=True,
-        )
-
-        assert len(results) == 2
-        assert all(r.success for r in results)
-        assert "p1.py" in results[0].stdout
-        assert "p2.py" in results[1].stdout
-
-    @pytest.mark.asyncio
-    async def test_mixed_results(self, tmp_config_dir):
-        good = tmp_config_dir / "scripts" / "good.py"
-        good.write_text("print('ok')\n")
-
-        bad = tmp_config_dir / "scripts" / "bad.py"
-        bad.write_text("import sys\nsys.exit(1)\n")
-
-        runner = ScriptRunner(tmp_config_dir)
-        results = await runner.run_multiple(
-            ["scripts/good.py", "scripts/bad.py"],
-            make_context(),
-            parallel=False,
-        )
-
-        assert len(results) == 2
-        assert results[0].success is True
-        assert results[1].success is False
-        assert results[1].exit_code == 1
-
-
 class TestCreateExampleScript:
     """Tests for the create_example_script helper."""
 
@@ -471,28 +409,6 @@ class TestScriptRunnerEdgeCases:
 
         assert not result.success
         assert "cannot write" in result.error
-
-    @pytest.mark.asyncio
-    async def test_run_multiple_parallel(self, tmp_path):
-        """Explicit parallel=True test for run_multiple."""
-        config_dir = tmp_path / "config"
-        (config_dir / "scripts").mkdir(parents=True)
-        runner = ScriptRunner(config_dir)
-
-        # Create two simple Python scripts
-        for name in ["a.py", "b.py"]:
-            script_path = config_dir / "scripts" / name
-            script_path.write_text("import sys; sys.exit(0)")
-
-        ctx = make_context()
-        results = await runner.run_multiple(
-            ["scripts/a.py", "scripts/b.py"],
-            ctx,
-            parallel=True,
-        )
-
-        assert len(results) == 2
-        assert all(r.success for r in results)
 
     @pytest.mark.asyncio
     async def test_context_file_cleanup_oserror(self, tmp_path):

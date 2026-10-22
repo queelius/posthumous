@@ -6,7 +6,6 @@ import asyncio
 import json
 import logging
 import os
-import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -248,32 +247,6 @@ class ScriptRunner:
                     os.unlink(context_file.name)
                 except OSError:
                     pass
-
-    async def run_multiple(
-        self,
-        scripts: list[str],
-        context: ScriptContext,
-        parallel: bool = False,
-    ) -> list[ScriptResult]:
-        """Run multiple scripts.
-
-        Args:
-            scripts: List of script paths
-            context: Context to pass to all scripts
-            parallel: If True, run scripts concurrently; otherwise sequentially
-
-        Returns:
-            List of results in same order as scripts
-        """
-        if parallel:
-            tasks = [self.run(script, context) for script in scripts]
-            return await asyncio.gather(*tasks)
-        else:
-            results = []
-            for script in scripts:
-                result = await self.run(script, context)
-                results.append(result)
-            return results
 
 
 def create_example_script(config_dir: Path, name: str = "on_trigger.py") -> Path:
